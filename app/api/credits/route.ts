@@ -30,7 +30,7 @@ export async function GET(req: Request) {
       const cells = line.split("|").map((c) => c.trim());
       // cells[0] is the empty chunk before the leading pipe.
       const [, model, author = "", source = "", license = ""] = cells;
-      if (!model || !source) continue;
+      if (!model) continue;
       if (isSeparatorCell(model)) continue;
       if (model.toLowerCase() === "model") continue; // header row
       credits.push({ model, author, source, license });

@@ -14,6 +14,7 @@ import {
   type Tier,
 } from "@/lib/rarity";
 import { useI18n, type Locale, type MsgKey } from "@/lib/i18n";
+import { fetchGhUser } from "@/lib/ghUser";
 import { CloseIcon, StarIcon } from "./Icons";
 import { WOOD } from "./TrunkRings";
 
@@ -868,8 +869,7 @@ function HouseInfoPanel({
     if (!login) return;
     let alive = true;
     setFollowersLoading(true);
-    fetch(`/api/gh-user?login=${encodeURIComponent(login)}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("gh-user"))))
+    fetchGhUser(login)
       .then((d) => {
         if (alive && typeof d.followers === "number") setFollowers(d.followers);
       })

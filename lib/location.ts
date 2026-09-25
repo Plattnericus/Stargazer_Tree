@@ -8,5 +8,3 @@ export const GOSSENSASS = {
   tz: "Europe/Rome",
   place: "Gossensass / Colle Isarco, Gemeinde Brenner",
 };
-
-export type TrackedLocation = typeof GOSSENSASS;

@@ -12,8 +12,8 @@ import { SUN_ANGULAR_DIAMETER_COS, type Atmosphere } from "@/lib/skyColor";
  * horizon, physically colored dawn/dusk, a real-scale sun disc, and a moonlit
  * Rayleigh glow at night. Weather flattens it toward an overcast deck or a
  * storm slate exactly like lib/skyColor.ts does for fog/lights, so the whole
- * scene reads from ONE atmosphere. One analytic evaluation per fragment — no
- * raymarch — so it is as cheap as the old gradient.
+ * scene reads from ONE atmosphere. One analytic evaluation per fragment, no
+ * raymarch.
  */
 
 const SKY_VERTEX = /* glsl */ `

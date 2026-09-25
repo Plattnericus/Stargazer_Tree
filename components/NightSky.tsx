@@ -171,6 +171,7 @@ function seeded(seed: number) {
 }
 
 function StarField({ params }: { params: SceneParams }) {
+  const points = useRef<THREE.Points>(null);
   const material = useRef<THREE.ShaderMaterial>(null);
   const count = useQualityProfile().stars;
   const geometry = useMemo(() => {
@@ -224,10 +225,13 @@ function StarField({ params }: { params: SceneParams }) {
     if (!m) return;
     m.uniforms.uTime.value = state.clock.elapsedTime;
     m.uniforms.uIntensity.value += (params.starsIntensity - m.uniforms.uIntensity.value) * Math.min(1, dt * 1.25);
+    // Skip the draw entirely by day instead of blending hundreds of
+    // fully transparent points.
+    if (points.current) points.current.visible = m.uniforms.uIntensity.value > 0.004;
   });
 
   return (
-    <points geometry={geometry} renderOrder={-8} frustumCulled={false}>
+    <points ref={points} geometry={geometry} renderOrder={-8} frustumCulled={false}>
       <shaderMaterial
         ref={material}
         uniforms={uniforms}
@@ -312,7 +316,7 @@ function Moon({ params }: { params: SceneParams }) {
 
   return (
     <mesh ref={mesh} renderOrder={-5} frustumCulled={false}>
-      <planeGeometry args={[1, 1, 48, 48]} />
+      <planeGeometry args={[1, 1]} />
       <shaderMaterial
         ref={material}
         uniforms={uniforms}

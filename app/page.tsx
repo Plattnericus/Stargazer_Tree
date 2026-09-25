@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import gsap from "gsap";
 import SettingsMenu, { type ManualDate } from "@/components/SettingsMenu";
 import Clock from "@/components/Clock";
@@ -18,7 +18,9 @@ import SearchBar from "@/components/SearchBar";
 import HouseInterior from "@/components/HouseInterior";
 import HouseFocusUI from "@/components/HouseFocusUI";
 import GameHUD from "@/components/GameHUD";
+import FpsCounter from "@/components/FpsCounter";
 import RateLimitNotice from "@/components/RateLimitNotice";
+import SoftwareRenderingNotice from "@/components/SoftwareRenderingNotice";
 import MemorialSecret from "@/components/MemorialSecret";
 import LoadingOverlay from "@/components/LoadingOverlay";
 import { FlyIcon } from "@/components/Icons";
@@ -27,9 +29,8 @@ import { nameForHouse, type Stargazer } from "@/lib/stargazers";
 import { resolveTier, TIER_RANK } from "@/lib/rarity";
 import { nowInZone } from "@/lib/astro";
 import { GOSSENSASS } from "@/lib/location";
-
-// Toggle the in-scene star editor via env (NEXT_PUBLIC_DEV_CONTROLS=true).
-const DEV_CONTROLS = process.env.NEXT_PUBLIC_DEV_CONTROLS === "true";
+import { readStorage, writeStorage } from "@/lib/storage";
+import { loadWalkPhysics } from "@/lib/walkPhysics";
 import {
   manualWeather,
   sceneFromWeather,
@@ -38,15 +39,40 @@ import {
   type Weather,
 } from "@/lib/weather";
 
+// Toggle the in-scene star editor via env (NEXT_PUBLIC_DEV_CONTROLS=true).
+const DEV_CONTROLS = process.env.NEXT_PUBLIC_DEV_CONTROLS === "true";
+
 const Experience = dynamic(() => import("@/components/Experience"), {
   ssr: false,
   loading: () => <div className="absolute inset-0 bg-[#0b1320]" />,
 });
 
 const STARGAZER_REFRESH_MS = 5 * 60 * 1000;
+const WEATHER_REFRESH_MS = 10 * 60 * 1000;
 const LOADER_INTRO_MS = 900;
 const GRAPHICS_STORAGE_KEY = "star-tree-graphics-quality";
 const FOV_STORAGE_KEY = "star-tree-fov";
+const FPS_STORAGE_KEY = "star-tree-show-fps";
+
+function todayManualDate(): ManualDate {
+  const now = new Date();
+  return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate(), hour: 13 };
+}
+
+// The poll returns a fresh array every time. Keep the previous one when the
+// content is identical so the scene doesn't rebuild houses, bridges and
+// lanterns every five minutes for nothing.
+function sameStargazers(a: Stargazer[] | null, b: Stargazer[] | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function prefetchWalk() {
+  loadWalkPhysics().catch(() => {
+    /* retried when walk mode is actually opened */
+  });
+}
 
 function isTextInputTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -83,11 +109,10 @@ function OrbitIcon({ className }: { className?: string }) {
   );
 }
 
-// Cheap DOM overlay for the walk-mode cinematic intro: fade-from-black flash
-// on entry + letterbox bars for the duration, driven purely by the `active`
-// boolean lifted from WalkControls' `introing` ref (same source of truth the
-// arc/skip logic uses — no separate skip state machine). No Canvas cost.
-function IntroOverlay({ active }: { active: boolean }) {
+// DOM overlay for the walk-mode intro: black while the physics module loads
+// (the scene remounts behind it once), then a fade from black and letterbox
+// bars for as long as WalkControls reports the intro running.
+function IntroOverlay({ active, loading }: { active: boolean; loading: boolean }) {
   const [flash, setFlash] = useState(active);
   useEffect(() => {
     if (!active) return;
@@ -96,13 +121,13 @@ function IntroOverlay({ active }: { active: boolean }) {
     return () => window.clearTimeout(id);
   }, [active]);
 
-  if (!active && !flash) return null;
+  if (!active && !flash && !loading) return null;
 
   return (
     <div aria-hidden className="pointer-events-none absolute inset-0 z-30 overflow-hidden">
       <div
         className="absolute inset-0 bg-black transition-opacity duration-500 ease-out"
-        style={{ opacity: flash ? 1 : 0 }}
+        style={{ opacity: flash || loading ? 1 : 0 }}
       />
       <div
         className={`absolute inset-x-0 top-0 bg-black transition-all duration-700 ease-out ${
@@ -196,13 +221,22 @@ function Home() {
   const [searchActive, setSearchActive] = useState(-1);
   const [camMode, setCamMode] = useState<CamMode>("orbit");
   const flying = camMode !== "orbit";
-  // Walk mode's cinematic intro (arc flythrough) — lifted out of the Canvas so
-  // the fade/letterbox overlay and crosshair suppression can live in the DOM.
+  // Walk mode's cinematic intro, lifted out of the Canvas so the overlay and
+  // HUD can react to it. `walkStarted` flips once WalkControls is running,
+  // i.e. the physics module has loaded.
   const [introing, setIntroing] = useState(false);
+  const [walkStarted, setWalkStarted] = useState(false);
   useEffect(() => {
-    if (camMode !== "walk") setIntroing(false);
+    if (camMode === "walk") return;
+    setIntroing(false);
+    setWalkStarted(false);
   }, [camMode]);
+  const handleIntroChange = useCallback((running: boolean) => {
+    setIntroing(running);
+    if (running) setWalkStarted(true);
+  }, []);
   const walkIntroing = camMode === "walk" && introing;
+  const walkLoading = camMode === "walk" && !walkStarted;
   const [focusedHouse, setFocusedHouse] = useState<number | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
@@ -213,6 +247,9 @@ function Home() {
   const [loaderIntroDone, setLoaderIntroDone] = useState(false);
   const [mountScene, setMountScene] = useState(false);
   const [graphicsQuality, setGraphicsQuality] = useState<GraphicsQuality>("auto");
+  // False until the saved quality has been read, so a stored manual choice
+  // never kicks off the auto benchmark first.
+  const [graphicsLoaded, setGraphicsLoaded] = useState(false);
   const [resolvedGraphicsQuality, setResolvedGraphicsQuality] =
     useState<ResolvedGraphicsQuality>("medium");
   const [autoTierReady, setAutoTierReady] = useState(false);
@@ -220,29 +257,33 @@ function Home() {
   const handleFov = (n: number) => {
     setFov(n);
     cameraBus.baseFov = n;
-    window.localStorage.setItem(FOV_STORAGE_KEY, String(n));
+    writeStorage(FOV_STORAGE_KEY, String(n));
   };
-  const now = new Date();
-  const [date, setDate] = useState<ManualDate>({
-    year: now.getFullYear(),
-    month: now.getMonth() + 1,
-    day: now.getDate(),
-    hour: 13,
-  });
+  const [showFps, setShowFps] = useState(false);
+  const handleShowFps = (on: boolean) => {
+    setShowFps(on);
+    writeStorage(FPS_STORAGE_KEY, on ? "1" : "0");
+  };
+  const [date, setDate] = useState<ManualDate>(todayManualDate);
 
   useEffect(() => {
     const id = window.setTimeout(() => setLoaderIntroDone(true), LOADER_INTRO_MS);
     return () => window.clearTimeout(id);
   }, []);
 
-  // ONE Escape hierarchy for the whole HUD: memorial → info → house panel → focus → menu.
-  // Fly mode is excluded — there Esc releases the pointer lock.
+  // One Escape order for the whole HUD, topmost layer first: memorial → menu →
+  // info → house panel → focus → open the menu. Fly/walk are excluded, there
+  // Esc releases the pointer lock.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || isTextInputTarget(event.target) || flying) return;
       event.preventDefault();
       if (secretOpen) {
         setSecretOpen(false);
+        return;
+      }
+      if (menuOpen) {
+        setMenuOpen(false);
         return;
       }
       if (infoOpen) {
@@ -258,11 +299,11 @@ function Home() {
         setSearchActive(-1);
         return;
       }
-      setMenuOpen((open) => !open);
+      setMenuOpen(true);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [flying, focusedHouse, infoOpen, secretOpen, selected]);
+  }, [flying, focusedHouse, infoOpen, menuOpen, secretOpen, selected]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -290,15 +331,20 @@ function Home() {
   }, [flying, focusedHouse, menuOpen, secretOpen, selected]);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem(GRAPHICS_STORAGE_KEY);
+    const saved = readStorage(GRAPHICS_STORAGE_KEY);
     if (isGraphicsQuality(saved)) setGraphicsQuality(saved);
+    setGraphicsLoaded(true);
   }, []);
 
   useEffect(() => {
-    const saved = Number(window.localStorage.getItem(FOV_STORAGE_KEY));
+    const saved = Number(readStorage(FOV_STORAGE_KEY));
     const n = Number.isFinite(saved) && saved >= MIN_FOV && saved <= MAX_FOV ? saved : DEFAULT_FOV;
     setFov(n);
     cameraBus.baseFov = n;
+  }, []);
+
+  useEffect(() => {
+    setShowFps(readStorage(FPS_STORAGE_KEY) === "1");
   }, []);
 
   // QA override: ?hour=21&sky=storm&day=3&month=7 forces manual weather so any
@@ -323,17 +369,16 @@ function Home() {
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(GRAPHICS_STORAGE_KEY, graphicsQuality);
+    if (!graphicsLoaded) return;
+    writeStorage(GRAPHICS_STORAGE_KEY, graphicsQuality);
     if (graphicsQuality !== "auto") {
       setResolvedGraphicsQuality(graphicsQuality);
       setAutoTierReady(true);
       return;
     }
-    // Auto-tier is now a measured real benchmark (short hidden-canvas probe),
-    // not a cores/memory guess — runs in parallel with the stars/weather
-    // fetches below, bounded well under the loader's own minimum visible
-    // time, so it never delays first paint. Always resolves (falls back to a
-    // static heuristic internally if the probe is inconclusive).
+    // Short GPU probe (see lib/benchmark.ts). Runs in parallel with the data
+    // fetches, finishes well within the loader's minimum visible time and
+    // always resolves.
     let cancelled = false;
     runGraphicsBenchmark().then((tier) => {
       if (cancelled) return;
@@ -343,7 +388,7 @@ function Home() {
     return () => {
       cancelled = true;
     };
-  }, [graphicsQuality]);
+  }, [graphicsLoaded, graphicsQuality]);
 
   const initialDataReady = starsReady && weatherReady;
 
@@ -370,15 +415,19 @@ function Home() {
   const switchingQuality = hasLoadedOnce && !sceneReady;
 
   useEffect(() => {
-    // Refresh stargazers every 5 minutes so new stars grow the tree live.
+    // Stargazers refresh every 5 minutes so new stars grow the tree live,
+    // weather every 10. Hidden tabs skip their turn and catch up when shown.
     // `no-store` keeps the browser from reusing an old response on startup.
-    const loadStars = () =>
-      fetch("/api/stargazers", { cache: "no-store" })
+    const lastLoad = { stars: 0, weather: 0 };
+    const loadStars = () => {
+      lastLoad.stars = Date.now();
+      return fetch("/api/stargazers", { cache: "no-store" })
         .then((r) => r.json())
         .then((d) => {
           if (typeof d.stars === "number") setStars(d.stars);
           setStarsLive(Boolean(d.live));
-          setStargazers(Array.isArray(d.stargazers) ? d.stargazers : null);
+          const next: Stargazer[] | null = Array.isArray(d.stargazers) ? d.stargazers : null;
+          setStargazers((prev) => (sameStargazers(prev, next) ? prev : next));
           const syncedAt = typeof d.fetchedAt === "number" ? d.fetchedAt : Date.now();
           setLastSync(syncedAt);
           setNextSync(Date.now() + STARGAZER_REFRESH_MS);
@@ -388,9 +437,11 @@ function Home() {
         .catch(() => {
           setStarsReady(true);
         });
+    };
 
-    const loadWeather = () =>
-      fetch("/api/weather")
+    const loadWeather = () => {
+      lastLoad.weather = Date.now();
+      return fetch("/api/weather")
         .then((r) => r.json())
         .then((d) => {
           setLiveWeather(weatherFromApiPayload(d));
@@ -400,15 +451,27 @@ function Home() {
           setLiveWeather(manualWeather(13, new Date().getMonth(), "clouds"));
           setWeatherReady(true);
         });
+    };
 
     loadStars();
     loadWeather();
-    // Refresh the live village every 5 minutes while the site is open.
-    const starId = setInterval(loadStars, STARGAZER_REFRESH_MS);
-    const weatherId = setInterval(loadWeather, 10 * 60 * 1000);
+    const starId = setInterval(() => {
+      if (!document.hidden) loadStars();
+    }, STARGAZER_REFRESH_MS);
+    const weatherId = setInterval(() => {
+      if (!document.hidden) loadWeather();
+    }, WEATHER_REFRESH_MS);
+    const onVisibility = () => {
+      if (document.hidden) return;
+      const now = Date.now();
+      if (now - lastLoad.stars >= STARGAZER_REFRESH_MS) loadStars();
+      if (now - lastLoad.weather >= WEATHER_REFRESH_MS) loadWeather();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       clearInterval(starId);
       clearInterval(weatherId);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 
@@ -536,14 +599,15 @@ function Home() {
             stargazers={stargazers}
             graphicsQuality={resolvedGraphicsQuality}
             uiOverlayOpen={overlayOpen}
+            showStats={showFps}
             onSelectHouse={handleHouseClick}
             onFindDove={() => setSecretOpen(true)}
             onReady={() => setSceneReady(true)}
-            onIntroChange={setIntroing}
+            onIntroChange={handleIntroChange}
           />
         )}
       </div>
-      <IntroOverlay active={walkIntroing} />
+      <IntroOverlay active={walkIntroing} loading={walkLoading} />
       {switchingQuality && (
         <div className="pointer-events-none fixed inset-0 z-40 grid place-items-center bg-[#0b1320]/72 backdrop-blur-sm transition-opacity duration-300">
           <div className="flex flex-col items-center gap-3 text-white/85">
@@ -562,6 +626,7 @@ function Home() {
         weatherReady={weatherReady}
       />
       {secretOpen && <MemorialSecret onClose={() => setSecretOpen(false)} />}
+      {showFps && sceneReady && <FpsCounter quality={resolvedGraphicsQuality} />}
 
       <div
         className={`transition duration-700 ease-out ${
@@ -597,31 +662,18 @@ function Home() {
                   type="button"
                   onClick={() => {
                     setCamMode(m);
-                    // Triggered inside the click handler — both fullscreen and
-                    // pointer-lock require a direct user gesture, which a later
-                    // effect (after the mode-switch re-render) would no longer
-                    // count as. The canvas already exists here: it mounts once
-                    // on scene-ready and persists across mode switches, only
-                    // the controls component swaps.
-                    //
-                    // Pointer-lock is requested AFTER fullscreen resolves, not
-                    // synchronously alongside it — calling both at once throws
-                    // "WrongDocumentError: root document ... not valid for
-                    // pointer lock" in Chrome (the fullscreen transition can
-                    // briefly reparent the document tree). Chaining off the
-                    // Promise keeps it in the same user-activation window.
+                    // Fullscreen and pointer lock need a direct user gesture,
+                    // so they're requested here rather than in an effect.
+                    // Pointer lock waits for fullscreen to resolve: requesting
+                    // both at once throws WrongDocumentError in Chrome.
                     if (m === "orbit") {
                       if (document.fullscreenElement) {
                         document.exitFullscreen?.().catch(() => {});
                       }
                       return;
                     }
-                    // Modern Chrome's requestPointerLock() returns a Promise
-                    // that REJECTS (e.g. WrongDocumentError) instead of
-                    // throwing synchronously — a plain try/catch does not
-                    // catch that; the returned promise itself needs a .catch,
-                    // or it surfaces as an unhandled rejection. Older
-                    // browsers can still throw synchronously, so guard both.
+                    // requestPointerLock() rejects its promise in current
+                    // Chrome and throws synchronously in older browsers.
                     const lock = () => {
                       try {
                         const result = document.querySelector("canvas")?.requestPointerLock?.();
@@ -636,6 +688,10 @@ function Home() {
                       document.documentElement.requestFullscreen?.().then(lock).catch(lock);
                     }
                   }}
+                  // Start fetching the physics chunk as soon as walk mode
+                  // looks likely, so the click has little left to wait for.
+                  onPointerEnter={m === "walk" ? prefetchWalk : undefined}
+                  onFocus={m === "walk" ? prefetchWalk : undefined}
                   aria-label={modeLabels[m]}
                   aria-pressed={active}
                   className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition active:scale-95 ${
@@ -657,10 +713,13 @@ function Home() {
             })}
           </div>
         )}
-        {flying && !coarse && !walkIntroing && (
+        {flying && !coarse && !walkIntroing && !walkLoading && (
           <GameHUD mode={camMode === "walk" ? "walk" : "fly"} />
         )}
-        <RateLimitNotice active={rateLimited} />
+        <div className="pointer-events-none absolute left-[calc(1.25rem+env(safe-area-inset-left))] top-[calc(1.25rem+env(safe-area-inset-top))] z-30 flex flex-col items-start gap-2">
+          <SoftwareRenderingNotice />
+          <RateLimitNotice active={rateLimited} />
+        </div>
 
         {selected !== null && (
           <HouseInterior
@@ -710,6 +769,7 @@ function Home() {
           graphicsQuality={graphicsQuality}
           resolvedGraphicsQuality={resolvedGraphicsQuality}
           fov={fov}
+          showFps={showFps}
           open={menuOpen}
           onOpenChange={setMenuOpen}
           onMode={setMode}
@@ -717,18 +777,14 @@ function Home() {
           onSky={setManualSky}
           onGraphicsQuality={setGraphicsQuality}
           onFov={handleFov}
+          onShowFps={handleShowFps}
           onReset={() => {
-            const fresh = new Date();
             setGraphicsQuality("auto");
             handleFov(DEFAULT_FOV);
+            handleShowFps(false);
             setMode("live");
             setManualSky("clear");
-            setDate({
-              year: fresh.getFullYear(),
-              month: fresh.getMonth() + 1,
-              day: fresh.getDate(),
-              hour: 13,
-            });
+            setDate(todayManualDate());
             setMenuOpen(false);
           }}
         />

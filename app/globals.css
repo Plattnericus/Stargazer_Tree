@@ -228,3 +228,23 @@ canvas {
 .markdown-body .octicon-link {
   display: none;
 }
+
+/* Range inputs are drawn with appearance: none (the track is an inline
+   gradient); without this the thumb falls back to the browser's blue. */
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #e0b25c;
+  border: 2px solid #241708;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: #e0b25c;
+  border: 2px solid #241708;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}

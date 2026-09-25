@@ -32,6 +32,8 @@ export type QualityProfile = {
   idleDpr: number;
   maxDpr: number;
   movingDpr: number;
+  /** Render at least at the screen's own pixel ratio (capped at 2), e.g. true 4K on a 4K Retina screen. */
+  nativeDpr: boolean;
   antialias: boolean;
   // Volumetric clouds
   idleCloudQuality: number;
@@ -82,6 +84,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     idleDpr: 0.9,
     maxDpr: 1.05,
     movingDpr: 0.88,
+    nativeDpr: false,
     antialias: false,
     idleCloudQuality: 0.26,
     movingCloudQuality: 0.05,
@@ -110,10 +113,8 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bloom: false,
     postprocessingSamples: 0,
     vignette: false,
-    // A single cheap SMAA pass is what actually fixes "grass looks pixelated
-    // from far away in orbit view" — thin instanced blade edges alias hard
-    // with zero edge-AA. low was the one tier without it; SMAA is cheap
-    // enough that every tier can afford it.
+    // A single cheap SMAA pass keeps distant grass from aliasing: thin
+    // instanced blade edges alias hard with zero edge AA.
     smaa: true,
     aerial: 0,
     ao: false,
@@ -125,6 +126,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     idleDpr: 1.0,
     maxDpr: 1.15,
     movingDpr: 1.0,
+    nativeDpr: false,
     antialias: false,
     idleCloudQuality: 0.42,
     movingCloudQuality: 0.08,
@@ -153,11 +155,8 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bloom: false,
     postprocessingSamples: 0,
     vignette: false,
-    // SMAA is the ONE lightweight AA pass this tier gets — it's what
-    // actually fixes "grass/leaves look pixelated at a distance" (thin
-    // instanced edges alias without any edge-AA), and now that Phase 1
-    // removed the redundant canvas-MSAA elsewhere, the budget for a single
-    // cheap post pass exists here too. Stays off during camera movement
+    // SMAA is the one lightweight AA pass: thin instanced grass/leaf edges
+    // alias badly without edge AA. It stays off during camera movement
     // (EffectComposer `enabled={!performanceMoving}` in Experience.tsx).
     smaa: true,
     aerial: 0,
@@ -170,6 +169,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     idleDpr: 1.2,
     maxDpr: 1.35,
     movingDpr: 1.15,
+    nativeDpr: false,
     antialias: false,
     idleCloudQuality: 0.54,
     movingCloudQuality: 0.1,
@@ -209,6 +209,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     idleDpr: 1.3,
     maxDpr: 1.4,
     movingDpr: 1.25,
+    nativeDpr: true,
     antialias: false,
     idleCloudQuality: 0.58,
     movingCloudQuality: 0.1,
@@ -248,6 +249,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     idleDpr: 1.6,
     maxDpr: 1.65,
     movingDpr: 1.45,
+    nativeDpr: true,
     antialias: false,
     idleCloudQuality: 0.62,
     movingCloudQuality: 0.12,

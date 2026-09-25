@@ -1,20 +1,40 @@
-# Drop your 3D models here
+# 3D models
 
-This is the asset folder. Put your `.glb` / `.gltf` files **in this folder**, then register each one
-in `models.json` (next to this file). The website loads models from that manifest — so once a file is
-here and listed in `models.json`, the scene can use it. No code edit needed to swap a model.
+Runtime `.glb` files. Components load them by path with `useGLTF` (see the
+`MODEL_ASSETS` list in `components/Experience.tsx` and the `useGLTF` calls in
+the components). Which building in the village pack belongs to which house
+tier is set by `TIER_BUILDING` in `lib/rarity.ts`.
 
-## Steps to add a model
+## Keep them small
 
-1. Export/download a **low-poly** model as `.glb` (preferred — single file) or `.gltf`.
-2. Copy it into this folder, e.g. `public/models/tree_trunk.glb`.
-3. Add an entry to `models.json` pointing at the file (see that file for the format).
-4. Reload the site.
+Every visitor downloads these, so compress them with
+[gltf-transform](https://gltf-transform.dev) (already a dev dependency) before
+committing. What the current files use:
 
-## Conventions
+| File | Treatment |
+| --- | --- |
+| `ant.glb`, `bird_orange.glb` | `resample` (animation), textures 512px WebP, `meshopt` |
+| `grass.glb` | `weld`, `meshopt` |
+| `island.glb` | from the uncompressed original (in git history): normals dropped, `weld`, `simplify` to ~20%, smooth normals rebuilt, `meshopt` |
+| `stylized_lantern.glb` | textures 512px WebP, geometry left as float |
+| `casual_village_buildings_pack.glb` | textures 1024px WebP, geometry left as float |
 
-- **Format:** `.glb` preferred. Keep it low-poly; compress with Draco/meshopt if large.
-- **Naming:** lowercase, snake_case, descriptive — `tree_trunk.glb`, `house_rare.glb`, `leaf.glb`.
-- **Scale/orientation:** model the tree growing **+Y up**, base at the origin (`y = 0`). Houses
-  should sit with their floor at `y = 0` too, so placement code doesn't have to guess offsets.
-- **Don't commit huge source files** (`.blend`, 4K textures) here — only the optimized runtime asset.
+Two rules the code depends on:
+
+- **Lantern and building geometry must stay float (no `meshopt`/`quantize`).**
+  Walk mode cooks their raw vertex arrays into physics colliders, and
+  quantized integers there would make the colliders thousands of times too big.
+- Code that bakes transforms into a model's geometry has to expand quantized
+  attributes to floats first (see `toFloatAttributes` in
+  `components/GrassClumps.tsx`).
+
+`useGLTF` decodes Meshopt out of the box. Draco would need an extra decoder
+download, so prefer Meshopt.
+
+## Licenses
+
+Every model here needs a row in `CREDITS.md` (the site's Credits panel is built
+from it). Sketchfab downloads carry author, license and source in
+`asset.extras`; gltf-transform keeps that block, so leave it in when
+re-optimizing. `bird_orange.glb` is CC-BY-NC-SA-4.0: non-commercial use only,
+and changed versions stay under that license.

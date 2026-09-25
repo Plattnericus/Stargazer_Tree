@@ -10,6 +10,22 @@ import { AERIAL_FRAG, CLOUD_SHADOW_FRAG } from "@/lib/shaderChunks";
 const GRASS = "/models/grass.glb";
 const TMP = new THREE.Object3D();
 
+// grass.glb is meshopt-compressed, so its attributes are quantized integers
+// (often interleaved). Baking a transform into those would clamp them, so
+// expand every attribute to plain floats before touching the geometry.
+function toFloatAttributes(geo: THREE.BufferGeometry) {
+  for (const name of Object.keys(geo.attributes)) {
+    const src = geo.getAttribute(name);
+    if (src instanceof THREE.BufferAttribute && src.array instanceof Float32Array) continue;
+    const size = src.itemSize;
+    const out = new Float32Array(src.count * size);
+    for (let i = 0; i < src.count; i++) {
+      for (let c = 0; c < size; c++) out[i * size + c] = src.getComponent(i, c);
+    }
+    geo.setAttribute(name, new THREE.BufferAttribute(out, size));
+  }
+}
+
 // Seeded RNG so the meadow is identical every reload.
 function mulberry(seed: number) {
   return () => {
@@ -22,10 +38,11 @@ function mulberry(seed: number) {
 }
 
 /**
- * Detailed hand-painted grass tufts (grass.glb, ~216k verts across 4 brush
- * layers, shared material). Each of the 4 layers is its own InstancedMesh that
- * shares the SAME per-tuft transforms, so the layers stay aligned and the whole
- * field is just 4 draw calls. A vertex shader bends the blades in the wind.
+ * Detailed hand-painted grass tufts (grass.glb, 4 brush layers). Each layer is
+ * its own InstancedMesh sharing the same per-tuft transforms, so the whole
+ * field is 4 draw calls. A vertex shader bends the blades in the wind.
+ * grass.glb is not preloaded: this component is only mounted on quality tiers
+ * that draw tufts, so the other tiers never download it.
  */
 export function GrassClumps({
   count = 18,
@@ -70,6 +87,7 @@ export function GrassClumps({
     src.traverse((o) => {
       if (o instanceof THREE.Mesh) {
         const g = o.geometry.clone();
+        toFloatAttributes(g);
         g.applyMatrix4(o.matrixWorld);
         g.computeBoundingBox();
         box.union(g.boundingBox!);
@@ -185,4 +203,3 @@ export function GrassClumps({
   );
 }
 
-useGLTF.preload(GRASS);

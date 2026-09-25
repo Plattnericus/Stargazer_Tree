@@ -7,7 +7,7 @@ import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 import { MAX_HOUSES } from "@/lib/layout";
 import { useQualityProfile } from "@/lib/quality";
-import { sampleBranchAnchors } from "@/lib/branches";
+import { bonsaiAnchors } from "@/lib/bonsai";
 import { trunkBaseRadius, trunkHeight } from "@/lib/growth";
 import { deckRadius } from "@/lib/rarity";
 import type { Stargazer } from "@/lib/stargazers";
@@ -15,7 +15,6 @@ import type { Stargazer } from "@/lib/stargazers";
 const ANT = "/models/ant.glb";
 const DECK = 0.35;
 const ANT_LEN = 1.16;
-
 
 type Ant =
   | {
@@ -74,7 +73,7 @@ export function Ants({
     Math.ceil(1 / agentBudget),
     moving ? 2 : 1,
   );
-  const anchors = useMemo(() => sampleBranchAnchors(null, MAX_HOUSES), []);
+  const anchors = useMemo(() => bonsaiAnchors(MAX_HOUSES), []);
   const active = Math.min(anchors.length, Math.max(0, Math.floor(stars)));
 
   const ants = useMemo<Ant[]>(() => {
@@ -124,6 +123,25 @@ export function Ants({
     box.getSize(size);
     const scale = ANT_LEN / Math.max(size.x, size.y, size.z, 0.001);
     const clip = animations[0];
+    // Every ant looks the same, so they all share one tweaked material copy
+    // instead of cloning it per ant.
+    const tweaked = new Map<THREE.Material, THREE.Material>();
+    const tweak = (mat: THREE.Material) => {
+      let out = tweaked.get(mat);
+      if (!out) {
+        if (mat instanceof THREE.MeshStandardMaterial) {
+          const cloned = mat.clone();
+          cloned.roughness = 0.86;
+          cloned.metalness = 0;
+          cloned.envMapIntensity = 0.5;
+          out = cloned;
+        } else {
+          out = mat;
+        }
+        tweaked.set(mat, out);
+      }
+      return out;
+    };
 
     return ants.map((_, i) => {
       const root = new THREE.Group();
@@ -133,14 +151,7 @@ export function Ants({
         if (!(obj instanceof THREE.Mesh)) return;
         obj.castShadow = true;
         obj.receiveShadow = true;
-        const mat = obj.material;
-        if (mat instanceof THREE.MeshStandardMaterial) {
-          const cloned = mat.clone();
-          cloned.roughness = 0.86;
-          cloned.metalness = 0;
-          cloned.envMapIntensity = 0.5;
-          obj.material = cloned;
-        }
+        if (!Array.isArray(obj.material)) obj.material = tweak(obj.material);
       });
       model.scale.setScalar(scale);
       root.add(model);
@@ -161,14 +172,17 @@ export function Ants({
   useFrame((state, dt) => {
     const d = Math.min(dt, 0.05);
     const t = state.clock.elapsedTime;
-    // Low tier updates skinned animations every Nth frame (accumulated dt so
-    // playback speed stays right) — big main-thread win, barely visible.
+    // Skinned animations update every Nth frame (accumulated dt keeps the
+    // playback speed right), and only for ants that are actually visible:
+    // houses that don't exist yet and ants inside a house skip the mixer.
     mixerFrame.current += 1;
     mixerAccum.current += d;
     if (mixerFrame.current % mixerStride === 0) {
       const step = mixerAccum.current;
       mixerAccum.current = 0;
-      mixers.current.forEach((mixer) => mixer?.update(step));
+      for (let i = 0; i < mixers.current.length; i++) {
+        if (refs.current[i]?.visible) mixers.current[i]?.update(step);
+      }
     }
     // trunk geometry the climbers ride (matches Tree.tsx): tall, thin, ends inside
     // the crown.

@@ -5,7 +5,7 @@ import { useFrame } from "@react-three/fiber";
 import { useGLTF } from "@react-three/drei";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 import * as THREE from "three";
-import { sampleBranchAnchors } from "@/lib/branches";
+import { bonsaiAnchors } from "@/lib/bonsai";
 import { makeWing, flapAngle } from "@/lib/wing";
 
 const BIRD = "/models/bird_orange.glb";
@@ -62,7 +62,7 @@ export function Birds({
   const { scene: birdScene, animations } = useGLTF(BIRD);
 
   // Real branch tips the birds can land on (procedural tree, tree-local space).
-  const perches = useMemo(() => sampleBranchAnchors(null, 14).map((a) => a.pos), []);
+  const perches = useMemo(() => bonsaiAnchors(14).map((a) => a.pos), []);
   const occupied = useRef<Set<number>>(new Set());
   // Only branches that have actually grown (one per star) are real perches —
   // otherwise birds "land" on an invisible branch and appear to hover mid-air.

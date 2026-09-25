@@ -8,11 +8,18 @@ import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js
 import gsap from "gsap";
 import { TIER_BUILDING, TIER_COLOR, TIER_SIZE, Tier, deckRadius, resolveTier } from "@/lib/rarity";
 import { MAX_HOUSES } from "@/lib/layout";
-import { sampleBranchAnchors, type Anchor } from "@/lib/branches";
-import { buildLantern, setLanternGlow, LANTERN_SIZE } from "@/lib/lantern";
+import { bonsaiAnchors, type BonsaiAnchor as Anchor } from "@/lib/bonsai";
+import {
+  buildLantern,
+  setLanternGlow,
+  LANTERN_LIGHT_THRESHOLD,
+  LANTERN_SIZE,
+  NIGHT_LIGHT,
+} from "@/lib/lantern";
 import { nameForIndex } from "@/lib/names";
 import type { Stargazer } from "@/lib/stargazers";
 import { useI18n, type MsgKey } from "@/lib/i18n";
+import { freezeTransforms } from "@/lib/matrixUpdates";
 
 const PACK = "/models/casual_village_buildings_pack.glb";
 const LANTERN = "/models/stylized_lantern.glb";
@@ -82,19 +89,24 @@ const WOOD_GROOVE = new THREE.MeshStandardMaterial({
   roughness: 0.9,
 });
 
-// Built as 3 merged meshes (one per material) instead of ~17 separate ones, so a
-// village of 40 houses costs ~120 platform draw calls, not ~680.
-function makePlatform(deckR: number): THREE.Group {
-  const g = new THREE.Group();
+type PlatformGeometry = {
+  deck: THREE.BufferGeometry;
+  grooves: THREE.BufferGeometry;
+  dark: THREE.BufferGeometry;
+};
+
+// Deck radius only depends on the tier, so there are just four distinct
+// platforms; every house of a tier shares the same buffers.
+const platformGeometryCache = new Map<number, PlatformGeometry>();
+
+function platformGeometry(deckR: number): PlatformGeometry {
+  const cached = platformGeometryCache.get(deckR);
+  if (cached) return cached;
   const m = new THREE.Matrix4();
 
   // deck slab (WOOD)
-  const deckGeo = new THREE.CylinderGeometry(deckR, deckR * 0.92, 0.34, 36);
-  deckGeo.translate(0, -0.17, 0);
-  const deck = new THREE.Mesh(deckGeo, WOOD);
-  deck.castShadow = true;
-  deck.receiveShadow = true;
-  g.add(deck);
+  const deck = new THREE.CylinderGeometry(deckR, deckR * 0.92, 0.34, 36);
+  deck.translate(0, -0.17, 0);
 
   // plank grooves (WOOD_GROOVE) — merged
   const grooveGeos: THREE.BufferGeometry[] = [];
@@ -105,9 +117,7 @@ function makePlatform(deckR: number): THREE.Group {
     gg.translate(0, 0.012, z);
     grooveGeos.push(gg);
   }
-  const grooves = new THREE.Mesh(mergeGeometries(grooveGeos, false), WOOD_GROOVE);
-  grooves.receiveShadow = true;
-  g.add(grooves);
+  const grooves = mergeGeometries(grooveGeos, false);
 
   // rim + rail + railing posts (WOOD_DARK) — merged
   const darkGeos: THREE.BufferGeometry[] = [];
@@ -123,10 +133,33 @@ function makePlatform(deckR: number): THREE.Group {
     post.translate(Math.cos(a) * deckR * 0.95, 0.25, Math.sin(a) * deckR * 0.95);
     darkGeos.push(post);
   }
-  const dark = new THREE.Mesh(mergeGeometries(darkGeos, false), WOOD_DARK);
+  const dark = mergeGeometries(darkGeos, false);
+
+  const result = { deck, grooves, dark };
+  platformGeometryCache.set(deckR, result);
+  return result;
+}
+
+// Built as 3 merged meshes (one per material) instead of ~17 separate ones, so a
+// village of 40 houses costs ~120 platform draw calls, not ~680.
+function makePlatform(deckR: number): THREE.Group {
+  const geo = platformGeometry(deckR);
+  const g = new THREE.Group();
+
+  const deck = new THREE.Mesh(geo.deck, WOOD);
+  deck.castShadow = true;
+  deck.receiveShadow = true;
+  g.add(deck);
+
+  const grooves = new THREE.Mesh(geo.grooves, WOOD_GROOVE);
+  grooves.receiveShadow = true;
+  g.add(grooves);
+
+  const dark = new THREE.Mesh(geo.dark, WOOD_DARK);
   dark.castShadow = true;
   g.add(dark);
 
+  freezeTransforms(g);
   return g;
 }
 
@@ -166,7 +199,9 @@ function useBuildingFactory(): BuildFn {
     return (tier: Tier) => {
       const src = geos.get(TIER_BUILDING[tier]);
       if (!src) return null;
-      const mesh = new THREE.Mesh(src.geo.clone(), toStandard(src.mat));
+      // The geometry is shared by every house of this tier (it's never
+      // modified); the material is per house so hover can brighten just one.
+      const mesh = new THREE.Mesh(src.geo, toStandard(src.mat));
       mesh.castShadow = true;
       mesh.rotation.x = -Math.PI / 2; // Z-up -> Y-up
       mesh.updateMatrixWorld(true);
@@ -180,6 +215,8 @@ function useBuildingFactory(): BuildFn {
       g.add(mesh);
       g.scale.setScalar(s);
       mesh.position.set(-center.x, -box.min.y, -center.z);
+      // The group gets a position prop from React, so only the mesh is frozen.
+      freezeTransforms(mesh);
       return g;
     };
   }, [scene]);
@@ -220,6 +257,11 @@ function House({
   const size = TIER_SIZE[tier];
   const [hovered, setHovered] = useState(false);
   const innerRef = useRef<THREE.Group>(null);
+  // Houses that already exist mount at full size; only new ones grow in. This
+  // also matters for walk mode, where the colliders are cooked from whatever
+  // is visible at mount: a house still at scale 0 would produce a garbage
+  // collider, and hidden inactive houses produce none.
+  const mountScale = useRef(active ? 1 : 0).current;
 
   // Built once and reused — hover re-renders don't rebuild the meshes.
   const built = useMemo(() => {
@@ -243,6 +285,15 @@ function House({
     const lr = deckR * (0.45 + 0.32 * rand(i + 5));
     return { building, platform, deckR, mats, la, lr };
   }, [tier, size, makeBuilding, i]);
+  useEffect(() => () => built.mats.forEach((m) => m.dispose()), [built]);
+
+  // Pointer handlers go away with `interactive` (fly/walk), so pointer-out
+  // never fires; drop the hover state and cursor ourselves.
+  useEffect(() => {
+    if (interactive || !hovered) return;
+    setHovered(false);
+    document.body.style.cursor = "auto";
+  }, [interactive, hovered]);
 
   // Built ONCE — rebuilding clones the whole model per night change (lag).
   const lantern = useMemo(
@@ -281,7 +332,7 @@ function House({
     };
   }, [hovered, focused, built]);
 
-  const lightsOn = night > 0.04;
+  const lightsOn = night > LANTERN_LIGHT_THRESHOLD;
   const eventHandlers = interactive
     ? {
         onClick: (e: ThreeEvent<MouseEvent>) => {
@@ -307,7 +358,8 @@ function House({
       ref={(g) => setRef(i, g)}
       position={anchor.pos}
       rotation={[0, i * 1.7, 0]}
-      scale={0}
+      scale={mountScale}
+      visible={mountScale > 0}
       {...eventHandlers}
     >
       <group ref={innerRef}>
@@ -315,11 +367,11 @@ function House({
         {built.building && <primitive object={built.building} position={[0, 0.04, 0]} />}
         <group position={[Math.cos(built.la) * built.lr, 0.04, Math.sin(built.la) * built.lr]}>
           <primitive object={lantern} />
-          {/* ALWAYS mounted: toggling a light's existence changes the light
-              count and forces every standard material in the scene to
-              recompile (the day/night switch freeze). Intensity 0 is free. */}
+          {/* Stays mounted; only visible at night (see NIGHT_LIGHT). */}
           {i < LIT_HOUSES && (
             <pointLight
+              name={NIGHT_LIGHT}
+              visible={lightsOn}
               color="#ffb765"
               position={[0, size * 0.45, 0]}
               intensity={active && lightsOn ? 6 * night : 0}
@@ -440,7 +492,7 @@ function ExtraDeckLanterns({
     }
   });
 
-  const lightsOn = night > 0.04;
+  const lightsOn = night > LANTERN_LIGHT_THRESHOLD;
   return (
     <group>
       {items.map((item, k) => (
@@ -451,9 +503,11 @@ function ExtraDeckLanterns({
           }}
         >
           <primitive object={item.lantern} />
-          {/* Always mounted — see the LIT_HOUSES note (recompile-free). */}
+          {/* Stays mounted; only visible at night (see NIGHT_LIGHT). */}
           {k < EXTRA_LIT_LANTERNS && (
             <pointLight
+              name={NIGHT_LIGHT}
+              visible={lightsOn}
               color="#ffbd73"
               position={[0, 0.42, 0]}
               intensity={lightsOn ? 4.8 * night : 0}
@@ -489,7 +543,7 @@ export function Houses({
 }) {
   const makeBuilding = useBuildingFactory();
   const { scene: lanternScene } = useGLTF(LANTERN);
-  const anchors = useMemo(() => sampleBranchAnchors(null, MAX_HOUSES), []);
+  const anchors = useMemo(() => bonsaiAnchors(MAX_HOUSES), []);
   const baseY = useMemo(() => anchors.map((anchor) => anchor.pos.y + 0.35), [anchors]);
 
   const groups = useRef<(THREE.Group | null)[]>([]);

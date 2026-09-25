@@ -317,6 +317,8 @@ function StormClouds({
       const target = active ? 1 : 0;
       const s = g.scale.x + (target - g.scale.x) * Math.min(1, dt * 3);
       g.scale.setScalar(s);
+      // Parked clouds (no rain) are not drawn at all.
+      g.visible = s > 0.01;
       const l = layout[i];
       const drift = Math.sin(t * 0.07 * l.drift + l.phase) * (3 + wind * 0.7 + gust * 0.35);
       const cross = Math.cos(t * 0.052 * l.drift + l.phase) * 1.5;
@@ -338,6 +340,7 @@ function StormClouds({
           }}
           position={l.pos}
           scale={0.001}
+          visible={false}
         >
           <mesh geometry={l.geo} material={mat} />
         </group>
@@ -411,8 +414,7 @@ function Lightning({
       flashRef.current = 0;
       if (light.current) light.current.intensity = 0;
       if (ambient.current) ambient.current.intensity = 0;
-      const off = bolt.current?.material as THREE.LineBasicMaterial | undefined;
-      if (off) off.opacity = 0;
+      if (bolt.current) bolt.current.visible = false;
       return;
     }
     if (t > next.current) {
@@ -433,13 +435,14 @@ function Lightning({
     if (ambient.current) ambient.current.intensity = f * 1.4;
     const m = bolt.current?.material as THREE.LineBasicMaterial | undefined;
     if (m) m.opacity = f > 0.5 ? 1 : 0;
+    if (bolt.current) bolt.current.visible = f > 0.5;
   });
 
   return (
     <group>
       <pointLight ref={light} color="#dbe7ff" intensity={0} distance={140} decay={1.4} />
       <ambientLight ref={ambient} color="#cfe0ff" intensity={0} />
-      <lineSegments ref={bolt} frustumCulled={false}>
+      <lineSegments ref={bolt} frustumCulled={false} visible={false}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
         </bufferGeometry>

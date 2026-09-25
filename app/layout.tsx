@@ -85,6 +85,12 @@ export async function generateMetadata(): Promise<Metadata> {
   };
 }
 
+// JSON for an inline <script>: escape "<" so text from the GitHub profile
+// (bio, company, …) can never close the script tag early.
+function inlineJson(data: unknown): string {
+  return JSON.stringify(data).replace(/</g, "\\u003c");
+}
+
 export default async function RootLayout({
   children,
 }: {
@@ -139,11 +145,11 @@ export default async function RootLayout({
         {children}
         <script
           type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
+          dangerouslySetInnerHTML={{ __html: inlineJson(jsonLd) }}
         />
         <script
           type="application/ld+json"
-          dangerouslySetInnerHTML={{ __html: JSON.stringify(websiteLd) }}
+          dangerouslySetInnerHTML={{ __html: inlineJson(websiteLd) }}
         />
       </body>
     </html>

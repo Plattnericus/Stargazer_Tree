@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 
@@ -10,26 +10,31 @@ import * as THREE from "three";
  */
 export function Fireflies({
   count = 45,
+  maxCount = count,
   radius = 11,
   baseY = 5.5,
   height = 9,
   night = 0,
 }: {
   count?: number;
+  /** Buffer size; `count` can then change (performance budget) without
+   *  reallocating or reshuffling the swarm. */
+  maxCount?: number;
   radius?: number;
   baseY?: number;
   height?: number;
   night?: number;
 }) {
   const matRef = useRef<THREE.ShaderMaterial>(null);
+  const capacity = Math.max(count, maxCount);
 
   const geometry = useMemo(() => {
     const g = new THREE.BufferGeometry();
-    const pos = new Float32Array(count * 3);
-    const seed = new Float32Array(count * 3);
-    const phase = new Float32Array(count);
-    const tint = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
+    const pos = new Float32Array(capacity * 3);
+    const seed = new Float32Array(capacity * 3);
+    const phase = new Float32Array(capacity);
+    const tint = new Float32Array(capacity);
+    for (let i = 0; i < capacity; i++) {
       const r = radius * Math.sqrt(Math.random());
       const a = Math.random() * Math.PI * 2;
       pos[i * 3] = Math.cos(a) * r;
@@ -47,7 +52,9 @@ export function Fireflies({
     g.setAttribute("aTint", new THREE.BufferAttribute(tint, 1));
     g.computeBoundingSphere();
     return g;
-  }, [count, radius, baseY, height]);
+  }, [capacity, radius, baseY, height]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
+  geometry.setDrawRange(0, Math.min(count, capacity));
 
   const material = useMemo(
     () =>

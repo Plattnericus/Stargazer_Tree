@@ -6,38 +6,8 @@ import type { Stargazer } from "@/lib/stargazers";
 import { nameForIndex } from "@/lib/names";
 import { tierForIndex, TIER_COLOR } from "@/lib/rarity";
 import { useI18n, type MsgKey } from "@/lib/i18n";
+import { fetchGhUser, type GhRepo, type GhUser } from "@/lib/ghUser";
 import { CloseIcon, StarIcon } from "./Icons";
-
-type Repo = {
-  name: string;
-  owner: string;
-  description: string | null;
-  stars: number;
-  lang: string | null;
-  langColor: string;
-  url: string;
-  pushedAt: string | null;
-  fork: boolean;
-};
-
-type GhUser = {
-  login: string;
-  name: string;
-  bio: string | null;
-  avatarUrl: string;
-  followers: number;
-  following: number;
-  location: string | null;
-  company: string | null;
-  blog: string | null;
-  twitter: string | null;
-  publicRepos: number;
-  htmlUrl: string;
-  pinned: Repo[];
-  pinnedIsFallback: boolean;
-  repos: Repo[];
-  readmeHtml: string | null;
-};
 
 const nf = (n: number) => new Intl.NumberFormat("en-US").format(n);
 
@@ -87,7 +57,7 @@ const RepoIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
-function RepoCard({ repo }: { repo: Repo }) {
+function RepoCard({ repo }: { repo: GhRepo }) {
   return (
     <a
       href={repo.url}
@@ -192,8 +162,7 @@ export default function HouseInterior({
     setState("loading");
     setUser(null);
     setTab("overview");
-    fetch(`/api/gh-user?login=${encodeURIComponent(login)}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
+    fetchGhUser(login)
       .then((d) => {
         if (!alive) return;
         if (d.error) return setState("error");

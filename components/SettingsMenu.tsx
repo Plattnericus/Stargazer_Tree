@@ -65,6 +65,14 @@ export type ManualDate = {
 };
 
 type Credit = { model: string; author: string; source: string; license: string };
+
+// Creative Commons ids as written in CREDITS.md ("CC-BY-4.0",
+// "CC-BY-NC-SA-4.0") map to their license deed, which attribution under
+// those licenses has to point to.
+function licenseUrl(license: string): string | null {
+  const m = /^CC-(BY(?:-NC)?(?:-SA|-ND)?)-(\d\.\d)$/i.exec(license.trim());
+  return m ? `https://creativecommons.org/licenses/${m[1].toLowerCase()}/${m[2]}/` : null;
+}
 type Tab = "settings" | "credits";
 
 function relTime(ms: number): string {
@@ -421,6 +429,7 @@ export default function SettingsMenu({
   graphicsQuality,
   resolvedGraphicsQuality,
   fov,
+  showFps,
   open,
   onOpenChange,
   onMode,
@@ -428,6 +437,7 @@ export default function SettingsMenu({
   onSky,
   onGraphicsQuality,
   onFov,
+  onShowFps,
   onReset,
 }: {
   weather: Weather | null;
@@ -443,6 +453,7 @@ export default function SettingsMenu({
   graphicsQuality: GraphicsQuality;
   resolvedGraphicsQuality: ResolvedGraphicsQuality;
   fov: number;
+  showFps: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onMode: (m: "live" | "manual") => void;
@@ -450,6 +461,7 @@ export default function SettingsMenu({
   onSky: (s: Sky) => void;
   onGraphicsQuality: (q: GraphicsQuality) => void;
   onFov: (n: number) => void;
+  onShowFps: (on: boolean) => void;
   onReset: () => void;
 }) {
   const { t, setLocale } = useI18n();
@@ -905,6 +917,25 @@ export default function SettingsMenu({
                     }}
                   />
                 </label>
+                <div className="flex items-center justify-between gap-3 pt-1.5">
+                  <span
+                    className="text-[10px] font-medium uppercase tracking-[0.12em]"
+                    style={{ color: WOOD.textDim }}
+                  >
+                    {t("settings.fps")}
+                  </span>
+                  <div className="w-40 shrink-0">
+                    <SlidingTabs<"off" | "on">
+                      options={["off", "on"]}
+                      value={showFps ? "on" : "off"}
+                      onChange={(v) => onShowFps(v === "on")}
+                      render={(v) => t(v === "on" ? "settings.on" : "settings.off")}
+                      thumbBackground={(v) => (v === "on" ? "#9fd272" : "rgba(240,226,200,0.92)")}
+                      activeColor={() => "#0a100d"}
+                      size="text-[10px]"
+                    />
+                  </div>
+                </div>
               </div>
 
               {/* 4 — Language (custom dropdown) */}
@@ -979,20 +1010,34 @@ export default function SettingsMenu({
                         <span className="text-[12px] font-bold" style={{ color: WOOD.text }}>
                           {cr.model}
                         </span>
-                        <button
-                          onClick={() => setConfirmLink(cr)}
-                          className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-[10.5px] font-bold transition hover:brightness-110 active:scale-95"
-                          style={{
-                            background: `linear-gradient(180deg, ${WOOD.accent}, #b8842f)`,
-                            color: WOOD.barkDark,
-                            boxShadow: "0 2px 5px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.25)",
-                          }}
-                        >
-                          {t("credits.open")} <span aria-hidden>↗</span>
-                        </button>
+                        {cr.source && (
+                          <button
+                            onClick={() => setConfirmLink(cr)}
+                            className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-[10.5px] font-bold transition hover:brightness-110 active:scale-95"
+                            style={{
+                              background: `linear-gradient(180deg, ${WOOD.accent}, #b8842f)`,
+                              color: WOOD.barkDark,
+                              boxShadow: "0 2px 5px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.25)",
+                            }}
+                          >
+                            {t("credits.open")} <span aria-hidden>↗</span>
+                          </button>
+                        )}
                       </div>
                       <div className="mt-0.5 text-[10.5px]" style={{ color: WOOD.textDim }}>
-                        {[cr.author, cr.license].filter(Boolean).join(" · ")}
+                        {cr.author}
+                        {cr.author && cr.license && " · "}
+                        {cr.license &&
+                          (licenseUrl(cr.license) ? (
+                            <button
+                              onClick={() => setConfirmLink({ ...cr, source: licenseUrl(cr.license)! })}
+                              className="underline decoration-dotted underline-offset-2 transition hover:brightness-125"
+                            >
+                              {cr.license}
+                            </button>
+                          ) : (
+                            cr.license
+                          ))}
                       </div>
                     </li>
                   ))}

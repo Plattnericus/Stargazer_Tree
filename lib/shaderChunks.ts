@@ -7,8 +7,9 @@
 // Cheap 2-band interference pattern over world XZ that drifts with the wind —
 // reads as cumulus shadows sliding over the island. Multiply into the albedo
 // BEFORE lighting so shaded spots still catch rim/sky light.
+// Skipped entirely under a clear sky, where it would multiply by exactly 1.
 export const CLOUD_SHADOW_FRAG = `
-{
+if (uCloudCover > 0.0) {
   vec2 cuv = vWPos.xz * 0.055 + normalize(uWindDir) * uTime * 0.02;
   float cl = sin(cuv.x * 2.1) * sin(cuv.y * 1.7)
            + 0.5 * sin(cuv.x * 4.3 + 1.7) * sin(cuv.y * 3.9 + 0.4);
@@ -24,14 +25,12 @@ export const CLOUD_SHADOW_FRAG = `
 // built-in — no need to declare it. A plain MIX (never additive here), so the
 // result always stays a valid blend between two already-valid colors — it can
 // only ever move the shading toward the sky tint, never break it. uAerial is 0
-// on low/medium, so the whole term is inert there.
+// on low/medium, where the branch skips the whole term.
 export const AERIAL_FRAG = `
-{
+if (uAerial > 0.0) {
   float aeD = length(vWPos - cameraPosition);
-  // Capped well below 1.0 (0.35 ceiling) — this term used to saturate toward
-  // a near-full mix into the (light, sky-toned) haze color at typical
-  // zoomed-out orbit distances, reading as the whole tree "going whiter"
-  // when zooming out instead of a subtle atmospheric depth cue.
+  // Capped at 0.35 so zoomed-out orbit distances get a subtle depth cue
+  // instead of washing the tree out toward the light haze color.
   float aeHaze = (1.0 - exp(-aeD * 0.007)) * uAerial * 0.35;
   diffuseColor.rgb = mix(diffuseColor.rgb, uHazeColor, aeHaze);
 }

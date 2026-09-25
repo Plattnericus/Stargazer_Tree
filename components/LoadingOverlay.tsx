@@ -128,15 +128,18 @@ export default function LoadingOverlay({
     return () => window.clearTimeout(id);
   }, [sceneReady]);
 
+  const idleStart = useRef(0);
   useEffect(() => {
-    const start = performance.now();
+    // The overlay stays mounted after it hides, so stop ticking once it exits.
+    if (exiting) return;
+    if (!idleStart.current) idleStart.current = performance.now();
     const id = window.setInterval(() => {
-      const seconds = (performance.now() - start) / 1000;
+      const seconds = (performance.now() - idleStart.current) / 1000;
       const softProgress = 12 + Math.log1p(seconds * 1.15) * 18;
       setIdleProgress(Math.min(92, softProgress));
     }, 180);
     return () => window.clearInterval(id);
-  }, []);
+  }, [exiting]);
 
   const targetProgress = useMemo(() => {
     if (sceneReady && sceneGraceDone && dataReady) return 100;
@@ -395,12 +398,6 @@ export default function LoadingOverlay({
           font-weight: 600;
           letter-spacing: 0.14em;
           padding-left: 0.14em;
-        }
-
-        .loader-subtitle {
-          font-size: 12px;
-          letter-spacing: 0.02em;
-          color: rgba(255, 255, 255, 0.42);
         }
 
         .loader-status {

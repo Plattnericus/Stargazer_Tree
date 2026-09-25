@@ -25,10 +25,42 @@ next-env.d.ts
 # large model backup (keep the optimized ones, not the 81MB source)
 /public/models/tree.original.glb
 
-#AI Slop
+# AI assistant / agent files
 AGENTS.md
+AGENT.md
 CLAUDE.md
-.claude
+CLAUDE.local.md
+GEMINI.md
+.claude/
+.claude-*
+.cursor/
+.cursorrules
+.cursorignore
+.windsurf/
+.windsurfrules
+.codeium/
+.continue/
+.aider*
+.codex/
+.gemini/
+.copilot/
+.github/copilot-instructions.md
+.github/instructions/
+.junie/
+.roo/
+.roomodes
+.clinerules
+.kilocode/
+.amazonq/
+.tabnine/
+.zed/
+.mcp.json
+mcp.json
+.playwright-mcp/
+.specstory/
+REQUIREMENTS.md
+_shot*.mjs
+*.ai-tmp.*
 
 # local image/asset backups (originals before edits)
 .backups/

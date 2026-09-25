@@ -1,46 +1,50 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { use, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useFrame, type ThreeElements } from "@react-three/fiber";
 import * as THREE from "three";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import gsap from "gsap";
 import { animated, useSpring } from "@react-spring/three";
 import { bonsaiNodes, makeTaperedTubeGeometry, spineAt } from "@/lib/bonsai";
-import { treeHeight, trunkBaseRadius, trunkHeight } from "@/lib/growth";
+import { trunkBaseRadius, trunkHeight } from "@/lib/growth";
 import { MAX_HOUSES } from "@/lib/layout";
 import { useQualityProfile } from "@/lib/quality";
 import { deckRadius, type Tier } from "@/lib/rarity";
 import { CLOUD_SHADOW_FRAG } from "@/lib/shaderChunks";
+import { SPRIG_STRIDE, type CanopyInput } from "@/lib/canopy";
+import { requestBarkTextures, useCanopy, type BarkTextures } from "@/lib/treeWorkerClient";
 
-type Clump = {
-  pos: THREE.Vector3;
-  rot: [number, number, number];
-  scl: number;
-  shade: number; // 0 deep inside the crown .. 1 outer/top (baked AO)
-  hue: number; // per-sprig warm/cool + translucency variation
-  phase: number; // wind decorrelation
-};
+// The grow-in animation plays once per page load. Later remounts of the scene
+// (quality switch, the first time walk mode adds physics) show the grown tree
+// right away instead of regrowing it.
+let growIntroPlayed = false;
 
 // Instanced leaf clumps for one canopy batch.
 function LeafClumps({
-  clumps,
+  sprigs,
   geometry,
   material,
   depthMaterial,
   grown,
+  density = 1,
   castShadow = false,
   receiveShadow = false,
 }: {
-  clumps: Clump[];
+  /** Packed sprigs from lib/canopy.ts (SPRIG_STRIDE numbers each). */
+  sprigs: Float64Array;
   geometry: THREE.BufferGeometry;
   material: THREE.Material;
   depthMaterial?: THREE.Material;
   grown: boolean;
+  /** Fraction of the sprigs to draw. They're shuffled, so fewer means evenly thinner. */
+  density?: number;
   castShadow?: boolean;
   receiveShadow?: boolean;
 }) {
   const ref = useRef<THREE.InstancedMesh>(null);
+  const firstGrowRun = useRef(true);
+  const count = sprigs.length / SPRIG_STRIDE;
   // Re-apply matrices after r3f recreates the instanced mesh.
   useLayoutEffect(() => {
     const mesh = ref.current;
@@ -48,31 +52,42 @@ function LeafClumps({
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();
     const e = new THREE.Euler();
+    const p = new THREE.Vector3();
     const s = new THREE.Vector3();
     // Per-instance shade/hue/phase for the leaf shader.
-    const aLeaf = new Float32Array(clumps.length * 3);
-    clumps.forEach((c, i) => {
-      e.set(c.rot[0], c.rot[1], c.rot[2]);
+    const aLeaf = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      const o = i * SPRIG_STRIDE;
+      p.set(sprigs[o], sprigs[o + 1], sprigs[o + 2]);
+      e.set(sprigs[o + 3], sprigs[o + 4], sprigs[o + 5]);
       q.setFromEuler(e);
-      s.setScalar(c.scl);
-      m.compose(c.pos, q, s);
+      s.setScalar(sprigs[o + 6]);
+      m.compose(p, q, s);
       mesh.setMatrixAt(i, m);
-      aLeaf[i * 3] = c.shade;
-      aLeaf[i * 3 + 1] = c.hue;
-      aLeaf[i * 3 + 2] = c.phase;
-    });
+      aLeaf[i * 3] = sprigs[o + 7];
+      aLeaf[i * 3 + 1] = sprigs[o + 8];
+      aLeaf[i * 3 + 2] = sprigs[o + 9];
+    }
     geometry.setAttribute("aLeaf", new THREE.InstancedBufferAttribute(aLeaf, 3));
     mesh.instanceMatrix.needsUpdate = true;
     // Correct culling sphere — the base sprig geometry alone is tiny.
     mesh.computeBoundingSphere();
     mesh.visible = grown;
     mesh.scale.setScalar(grown ? 1 : 0.001);
-  }, [clumps, geometry, grown]);
+  }, [sprigs, count, geometry, grown]);
+
+  useLayoutEffect(() => {
+    const mesh = ref.current;
+    if (mesh) mesh.count = Math.max(1, Math.round(count * Math.min(1, density)));
+  }, [count, density]);
 
   // Animate canopy growth.
   useEffect(() => {
     const mesh = ref.current;
     if (!mesh) return;
+    const skipIntro = firstGrowRun.current && growIntroPlayed;
+    firstGrowRun.current = false;
+    if (skipIntro) return; // the layout effect already set the final state
     gsap.killTweensOf(mesh.scale);
     if (grown) {
       mesh.visible = true;
@@ -98,7 +113,7 @@ function LeafClumps({
   return (
     <instancedMesh
       ref={ref}
-      args={[geometry, material, clumps.length]}
+      args={[geometry, material, count]}
       customDepthMaterial={depthMaterial}
       castShadow={castShadow}
       receiveShadow={receiveShadow}
@@ -108,160 +123,9 @@ function LeafClumps({
   );
 }
 
-const BARK = "#6b4028";
-const BARK_DARK = "#352016";
-const BARK_LIGHT = "#a87854";
-
-// Procedural bark texture generated once per resolution and cached.
-const _barkTex = new Map<
-  number,
-  { map: THREE.Texture; bump: THREE.Texture; rough: THREE.Texture }
->();
-function getBarkTextures(size = 512) {
-  const cached = _barkTex.get(size);
-  if (cached) return cached;
-  const S = size;
-  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-  const clamp01 = (n: number) => (n < 0 ? 0 : n > 1 ? 1 : n);
-  const byte = (n: number) => Math.max(0, Math.min(255, n | 0));
-  const smooth = (e0: number, e1: number, x: number) => {
-    const t = clamp01((x - e0) / (e1 - e0));
-    return t * t * (3 - 2 * t);
-  };
-  // Cylindrical noise keeps bark seamless around the trunk.
-  const hash3 = (i: number, j: number, k: number) => {
-    const x = Math.sin(i * 127.1 + j * 311.7 + k * 74.7) * 43758.5453;
-    return x - Math.floor(x);
-  };
-  const vnoise3 = (x: number, y: number, z: number) => {
-    const xi = Math.floor(x);
-    const yi = Math.floor(y);
-    const zi = Math.floor(z);
-    const xf = x - xi;
-    const yf = y - yi;
-    const zf = z - zi;
-    const u = xf * xf * (3 - 2 * xf);
-    const v = yf * yf * (3 - 2 * yf);
-    const w = zf * zf * (3 - 2 * zf);
-    const c000 = hash3(xi, yi, zi);
-    const c100 = hash3(xi + 1, yi, zi);
-    const c010 = hash3(xi, yi + 1, zi);
-    const c110 = hash3(xi + 1, yi + 1, zi);
-    const c001 = hash3(xi, yi, zi + 1);
-    const c101 = hash3(xi + 1, yi, zi + 1);
-    const c011 = hash3(xi, yi + 1, zi + 1);
-    const c111 = hash3(xi + 1, yi + 1, zi + 1);
-    return lerp(
-      lerp(lerp(c000, c100, u), lerp(c010, c110, u), v),
-      lerp(lerp(c001, c101, u), lerp(c011, c111, u), v),
-      w,
-    );
-  };
-  const fbm3 = (x: number, y: number, z: number) => {
-    let a = 0.5;
-    let s = 0;
-    for (let k = 0; k < 3; k++) {
-      s += a * vnoise3(x, y, z);
-      x *= 2.03;
-      y *= 2.03;
-      z *= 2.03;
-      a *= 0.5;
-    }
-    return s / 0.875;
-  };
-  const mk = () => {
-    const cv = document.createElement("canvas");
-    cv.width = cv.height = S;
-    return cv;
-  };
-  const colCv = mk();
-  const bumpCv = mk();
-  const roughCv = mk();
-  const cctx = colCv.getContext("2d")!;
-  const bctx = bumpCv.getContext("2d")!;
-  const rctx = roughCv.getContext("2d")!;
-  const cI = cctx.createImageData(S, S);
-  const bI = bctx.createImageData(S, S);
-  const rI = rctx.createImageData(S, S);
-  for (let y = 0; y < S; y++) {
-    for (let x = 0; x < S; x++) {
-      const fx = x / S;
-      const fy = y / S;
-      const ang = fy * Math.PI * 2;
-      const R = 1.7;
-      const cx = Math.cos(ang) * R;
-      const cz = Math.sin(ang) * R;
-      const up = fx * 6.0;
-      // Domain warp creates organic bark variation.
-      const nA = fbm3(cx * 0.9 + 1.3, up * 0.9, cz * 0.9) - 0.5;
-      const nB = fbm3(cx * 0.9 + 7.7, up * 0.9 + 5.1, cz * 0.9 + 4.4) - 0.5;
-      const cxw = cx + nA * 0.7;
-      const czw = cz + nB * 0.7;
-      const upw = up + (nA + nB) * 0.6;
-      const blotch = fbm3(cxw * 0.85, upw * 0.55, czw * 0.85);
-      const plate = fbm3(cxw * 1.5, upw * 1.0, czw * 1.5);
-      const crackN = fbm3(cxw * 2.3, upw * 2.7, czw * 2.3);
-      const ridged = 1 - Math.abs(crackN * 2 - 1);
-      const crack = Math.pow(1 - ridged, 2.4);
-      const grain = fbm3(cx * 7.5, up * 13.0, cz * 7.5);
-      const lich = smooth(0.6, 0.82, blotch);
-      // Moss grows on ONE (weather) side of the trunk and thickest near the
-      // base — a green fbm gated by azimuth (fy in [0,1] = angle) and height.
-      const mossSide = smooth(0.05, 0.4, Math.cos(ang - 1.1) * 0.5 + 0.5);
-      const mossLow = 1 - smooth(0.15, 0.55, fx);
-      const mossN = smooth(0.45, 0.75, fbm3(cxw * 1.7 + 3.3, upw * 1.2, czw * 1.7));
-      const moss = clamp01(mossSide * mossLow * mossN);
-      // Height map for bark relief.
-      let h = 0.46 + (plate - 0.5) * 0.5 + (blotch - 0.5) * 0.26 - crack * 0.85 + (grain - 0.5) * 0.16;
-      h = clamp01(h);
-      // Color variation for bark, lichen, and cracks.
-      const tone = clamp01(blotch * 0.55 + plate * 0.45);
-      let r = lerp(86, 170, tone);
-      let g = lerp(56, 116, tone);
-      let b = lerp(36, 74, tone);
-      r = lerp(r, 150, lich * 0.45);
-      g = lerp(g, 156, lich * 0.45);
-      b = lerp(b, 128, lich * 0.38);
-      r = lerp(r, 32, crack * 0.92);
-      g = lerp(g, 23, crack * 0.92);
-      b = lerp(b, 15, crack * 0.92);
-      // Damp green moss on the weather side.
-      r = lerp(r, 74, moss * 0.7);
-      g = lerp(g, 92, moss * 0.7);
-      b = lerp(b, 48, moss * 0.7);
-      const gv = (grain - 0.5) * 22;
-      const idx = (y * S + x) * 4;
-      cI.data[idx] = byte(r + gv);
-      cI.data[idx + 1] = byte(g + gv * 0.7);
-      cI.data[idx + 2] = byte(b + gv * 0.4);
-      cI.data[idx + 3] = 255;
-      const hv = byte(h * 255);
-      bI.data[idx] = bI.data[idx + 1] = bI.data[idx + 2] = hv;
-      bI.data[idx + 3] = 255;
-      const rv = byte(clamp01(0.74 + crack * 0.36 - (plate - 0.5) * 0.14 + moss * 0.2) * 255);
-      rI.data[idx] = rI.data[idx + 1] = rI.data[idx + 2] = rv;
-      rI.data[idx + 3] = 255;
-    }
-  }
-  cctx.putImageData(cI, 0, 0);
-  bctx.putImageData(bI, 0, 0);
-  rctx.putImageData(rI, 0, 0);
-  const map = new THREE.CanvasTexture(colCv);
-  const bump = new THREE.CanvasTexture(bumpCv);
-  const rough = new THREE.CanvasTexture(roughCv);
-  map.colorSpace = THREE.SRGBColorSpace;
-  for (const t of [map, bump, rough]) {
-    t.wrapS = t.wrapT = THREE.RepeatWrapping;
-    t.repeat.set(3, 1);
-    t.anisotropy = 16;
-  }
-  const result = { map, bump, rough };
-  _barkTex.set(size, result);
-  return result;
-}
-
-function makeBarkMaterial(_color = BARK, size = 512) {
-  const { map, bump, rough } = getBarkTextures(size);
+// The procedural bark texture (lib/barkTexture.ts, built in the tree worker)
+// carries all the color, so the trunk, branches and roots share one material.
+function makeBarkMaterial({ map, bump, rough }: BarkTextures) {
   return new THREE.MeshStandardMaterial({
     color: 0xffffff,
     map,
@@ -346,8 +210,13 @@ transformed.x += wdir.x * downwind + wside.x * lateral;
 transformed.z += wdir.y * downwind + wside.y * lateral;
 transformed.y += sin(uTime * 1.6 + lph * 1.3) * 0.012 * uWind * hf;
 transformed += normal * (flutter * 0.015 * uWind);
+`;
+// World position for the visible leaves' fragment effects (the depth pass
+// doesn't need it). Two matrix-vector products rather than building
+// modelMatrix * instanceMatrix per vertex, which costs ~3x the multiplies.
+const LEAF_WORLD_POS = `
 #ifdef USE_INSTANCING
-  vWPos = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+  vWPos = (modelMatrix * (instanceMatrix * vec4(transformed, 1.0))).xyz;
 #else
   vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
 #endif
@@ -497,6 +366,7 @@ function makeLeafMaterial(
   atlas: THREE.Texture,
   uniforms: LeafUniforms,
   alphaToCoverage: boolean,
+  receivesShadows: boolean,
 ) {
   const mat = new THREE.MeshStandardMaterial({
     color: "#ffffff",
@@ -513,8 +383,18 @@ function makeLeafMaterial(
       LEAF_WIND_PARS +
       shader.vertexShader.replace(
         "#include <begin_vertex>",
-        `#include <begin_vertex>\n${LEAF_WIND_VERTEX}`,
+        `#include <begin_vertex>\n${LEAF_WIND_VERTEX}\n${LEAF_WORLD_POS}`,
       );
+    if (!receivesShadows) {
+      // Below Ultra the canopy never receives shadows (receiveShadow is
+      // always false), so the shadow-map coordinates and lookups it would
+      // compute per vertex and per fragment are dropped from its shader.
+      // The shadow factor was always 1.0, so the output doesn't change.
+      shader.vertexShader = shader.vertexShader.replace("#include <shadowmap_vertex>", "");
+      shader.fragmentShader = shader.fragmentShader.replace("#include <lights_fragment_begin>", () =>
+        THREE.ShaderChunk.lights_fragment_begin.replaceAll("&& receiveShadow )", "&& false )"),
+      );
+    }
     shader.fragmentShader =
       `
 uniform float uTime;
@@ -571,19 +451,22 @@ varying vec3 vWPos;
         // Aerial perspective: a warm sun-lit haze builds on the DISTANT crown as
         // a depth cue. Purely additive — it can only add light, never blank the
         // canopy — and it's gated by uAerial (0 on low/medium).
-        float aeD = length(vWPos - cameraPosition);
-        float aeHaze = (1.0 - exp(-aeD * 0.013)) * uAerial;
-        vec3 aeView = normalize(vWPos - cameraPosition);
-        float aeSun = max(dot(aeView, normalize(uSunDirW)), 0.0);
-        totalEmissiveRadiance += uSunColor * aeHaze * (0.2 + 0.8 * pow(aeSun, 3.0)) * 0.5;`,
+        if (uAerial > 0.0) {
+          float aeD = length(vWPos - cameraPosition);
+          float aeHaze = (1.0 - exp(-aeD * 0.013)) * uAerial;
+          vec3 aeView = normalize(vWPos - cameraPosition);
+          float aeSun = max(dot(aeView, normalize(uSunDirW)), 0.0);
+          totalEmissiveRadiance += uSunColor * aeHaze * (0.2 + 0.8 * pow(aeSun, 3.0)) * 0.5;
+        }`,
         );
   };
+  // The shader source depends on receivesShadows, so it must be in the key.
+  mat.customProgramCacheKey = () => `leaf:${receivesShadows}`;
   return mat;
 }
 
 // Leaf sprig geometry used by each canopy instance: 24 gently folded quad
-// cards (4 tris each — ~2.6× cheaper than the old bezier cards), each
-// UV-mapped to one atlas tile so a single card reads as a small leaf cluster.
+// cards (4 tris each), each UV-mapped to one atlas tile so a single card reads as a small leaf cluster.
 // Soft "volume" normals make the crown shade like a rounded mass instead of a
 // pile of flat cards.
 function makeLeafSprigGeometry(): THREE.BufferGeometry {
@@ -699,6 +582,7 @@ export function Tree({
   wet = 0,
   cloudCover = 0,
   forceProxyShadows = false,
+  leafDensity = 1,
   stargazers = null,
   children,
   ...props
@@ -716,6 +600,8 @@ export function Tree({
   wet?: number;
   cloudCover?: number;
   forceProxyShadows?: boolean;
+  /** Share of leaf sprigs drawn; lowered by adaptive quality on weak GPUs. */
+  leafDensity?: number;
   stargazers?: { tier?: Tier }[] | null;
 } & ThreeElements["group"]) {
   const swayRef = useRef<THREE.Group>(null);
@@ -748,16 +634,33 @@ export function Tree({
     uAerial: { value: 0 },
   });
 
+  // The bark texture and the collision-aware canopy (merged twigs + instanced
+  // leaf sprigs) are generated in workers (lib/treeWorkerClient.ts). Both jobs
+  // are requested before suspending on either, so they run side by side.
+  const barkRequest: Promise<BarkTextures> = requestBarkTextures(quality.barkTexSize);
+  const canopyInput = useMemo<CanopyInput>(
+    () => ({
+      active,
+      stars,
+      sprigDensity,
+      budgetScale: quality.canopyBudgetScale,
+      deckRadii: Array.from({ length: active }, (_, i) => deckRadius(i, stargazers)),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- tierKey captures the only stargazer data used (deck tiers)
+    [active, stars, sprigDensity, quality.canopyBudgetScale, tierKey],
+  );
+  const canopy = useCanopy(canopyInput);
+  const barkTextures = use(barkRequest);
+
   const materials = useMemo(
     () => ({
-      bark: makeBarkMaterial(BARK, quality.barkTexSize),
-      barkDark: makeBarkMaterial(BARK_DARK, quality.barkTexSize),
-      barkLight: makeBarkMaterial(BARK_LIGHT, quality.barkTexSize),
+      bark: makeBarkMaterial(barkTextures),
       ringCap: makeRingCapMaterial(),
       leaf: makeLeafMaterial(
         getLeafAtlas(quality.leafAtlasSize),
         windUniforms.current,
         quality.antialias,
+        quality.canopySelfShadow,
       ),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- quality is fixed per Canvas mount (tier change remounts)
@@ -872,6 +775,15 @@ export function Tree({
       caps: capGeos.length ? mergeGeometries(capGeos, false) : null,
     };
   }, [trunkH, trunkR]);
+  // The trunk is rebuilt whenever the star count changes; free the old buffers.
+  useEffect(
+    () => () => {
+      woodGeos.bark.dispose();
+      woodGeos.roots.dispose();
+      woodGeos.caps?.dispose();
+    },
+    [woodGeos],
+  );
 
   const branchPieces = useMemo(() => {
     return nodes.map((node) => {
@@ -890,6 +802,7 @@ export function Tree({
       return { node, branchGeo };
     });
   }, [nodes]);
+  useEffect(() => () => branchPieces.forEach((p) => p.branchGeo.dispose()), [branchPieces]);
 
   const planter = useMemo(makePlanterGeometry, []);
 
@@ -916,357 +829,29 @@ export function Tree({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- tierKey captures the only stargazer data used (deck tiers)
   }, [active, nodes, tierKey]);
 
-  // Collision-aware canopy generated as merged branches and instanced leaves.
-  const crownStructure = useMemo(() => {
-    const decks = Array.from({ length: active }, (_, i) => {
-      const r = deckRadius(i, stargazers);
-      return { c: nodes[i].tip, r, top: 0.35 + (r / 1.5) * 1.9 };
-    });
-    // Keep foliage clear of decks, houses, and bridge corridors.
-    const blocked = (p: THREE.Vector3, scl: number) => {
-      const pad = 0.35 + scl * 0.22;
-      for (const d of decks) {
-        const dx = p.x - d.c.x;
-        const dz = p.z - d.c.z;
-        if (
-          dx * dx + dz * dz < (d.r + pad) * (d.r + pad) &&
-          p.y > d.c.y - 0.5 - scl * 0.3 &&
-          p.y < d.c.y + d.top + scl * 0.45
-        )
-          return true;
-      }
-      for (let i = 0; i < decks.length; i++) {
-        for (let j = i + 1; j < decks.length; j++) {
-          const a = decks[i].c;
-          const b = decks[j].c;
-          const gap = Math.hypot(b.x - a.x, b.z - a.z) - decks[i].r - decks[j].r;
-          if (gap < 0.4 || gap > 6) continue;
-          const abx = b.x - a.x;
-          const abz = b.z - a.z;
-          const t = THREE.MathUtils.clamp(
-            ((p.x - a.x) * abx + (p.z - a.z) * abz) / (abx * abx + abz * abz),
-            0,
-            1,
-          );
-          const cx = a.x + abx * t;
-          const cz = a.z + abz * t;
-          const cy = a.y + (b.y - a.y) * t + 0.5;
-          const rr = 1.0 + scl * 0.45;
-          if ((p.x - cx) ** 2 + (p.z - cz) ** 2 < rr * rr && Math.abs(p.y - cy) < 1.2 + scl * 0.3)
-            return true;
-        }
-      }
-      return false;
-    };
+  const canopyBranches = useMemo(() => {
+    if (!canopy.branch) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(canopy.branch.position, 3));
+    g.setAttribute("normal", new THREE.BufferAttribute(canopy.branch.normal, 3));
+    g.setAttribute("uv", new THREE.BufferAttribute(canopy.branch.uv, 2));
+    g.setIndex(new THREE.BufferAttribute(canopy.branch.index, 1));
+    return g;
+  }, [canopy]);
+  useEffect(() => () => canopyBranches?.dispose(), [canopyBranches]);
 
-    // Crown bounds wrap the platforms and cover the trunk tip.
-    let lowPlatY = Infinity;
-    let maxReach = 3.2;
-    for (let i = 0; i < active; i++) {
-      const t = nodes[i].tip;
-      maxReach = Math.max(maxReach, Math.hypot(t.x, t.z) + deckRadius(i, stargazers));
-      lowPlatY = Math.min(lowPlatY, nodes[i].base.y);
-    }
-    if (!isFinite(lowPlatY)) lowPlatY = 2;
-    const trunkTopY = trunkHeight(stars);
-    const apexY = treeHeight(stars);
-    const cBot = Math.max(1.0, lowPlatY - 0.8);
-    const cRX = maxReach + 1.0;
-    const span = Math.max(2, apexY - cBot);
-    const GA = Math.PI * (3 - Math.sqrt(5));
-    const BS = quality.canopyBudgetScale;
-    // A giant tree carries proportionally bigger tufts instead of exploding
-    // the instance count.
-    const sprigBoost = 1 + 0.15 * THREE.MathUtils.clamp(span / 14 - 1, 0, 1);
-
-    // Recursive branch system for the canopy.
-    const branchGeos: THREE.BufferGeometry[] = [];
-    const sprigs: Clump[] = [];
-    let seed = 7;
-    const rnd = () => {
-      seed += 1;
-      const x = Math.sin(seed * 91.7 + 13.1) * 43758.5453;
-      return x - Math.floor(x);
-    };
-    const UP = new THREE.Vector3(0, 1, 0);
-    // Rotate child branches away from the parent direction.
-    const childDir = (dir: THREE.Vector3, spread: number) => {
-      const ref = Math.abs(dir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : UP;
-      const p1 = new THREE.Vector3().crossVectors(dir, ref).normalize();
-      const p2 = new THREE.Vector3().crossVectors(dir, p1).normalize();
-      const ang = rnd() * Math.PI * 2;
-      const axis = p1
-        .multiplyScalar(Math.cos(ang))
-        .addScaledVector(p2, Math.sin(ang))
-        .normalize();
-      return dir.clone().applyAxisAngle(axis, spread).addScaledVector(UP, 0.28).normalize();
-    };
-    const addLeaf = (p: THREE.Vector3, anchor?: THREE.Vector3, twigRadius = 0.018) => {
-      // Crown-depth shade input: radial distance from the spine relative to
-      // the local dome radius (reused below as baked per-instance AO).
-      const vh = THREE.MathUtils.clamp((p.y - cBot) / span, 0, 1);
-      const dR = Math.max(0.6, cRX * (0.5 + 0.5 * Math.min(1, vh * 1.2)));
-      const spn = spineAt(p.y);
-      const radial = Math.hypot(p.x - spn.x, p.z - spn.z) / dR;
-      let scl = (0.7 + rnd() * 0.75) * sprigBoost;
-      // Bigger tufts on the silhouette break the smooth dome into real lobes.
-      if (radial > 0.8) scl *= 1.25;
-      if (blocked(p, scl)) return;
-      if (anchor) {
-        const d = p.distanceTo(anchor);
-        if (d > 0.05) {
-          const mid = anchor.clone().lerp(p, 0.65);
-          mid.y += d * 0.08;
-          branchGeos.push(
-            makeTaperedTubeGeometry(
-              [anchor, mid, p],
-              twigRadius,
-              twigRadius * 0.42,
-              2,
-              4,
-              seed * 0.37,
-            ),
-          );
-        }
-      }
-      const shade = THREE.MathUtils.clamp(radial * 0.85 + vh * 0.25, 0, 1);
-      sprigs.push({
-        pos: p,
-        rot: [rnd() * Math.PI * 2, rnd() * Math.PI * 2, rnd() * Math.PI],
-        scl,
-        shade,
-        hue: rnd(),
-        phase: rnd(),
-      });
-    };
-    const addLeafBurst = (
-      anchor: THREE.Vector3,
-      dir: THREE.Vector3,
-      baseCount: number,
-      spread: number,
-      twigRadius: number,
-    ) => {
-      // Canopy density scales with the graphics tier.
-      const count = Math.max(1, Math.round(baseCount * sprigDensity));
-      for (let b = 0; b < count; b++) {
-        const side = new THREE.Vector3(
-          Math.cos(seed * 0.91 + b * 2.399),
-          (rnd() - 0.45) * 0.7,
-          Math.sin(seed * 0.91 + b * 2.399),
-        )
-          .addScaledVector(dir, 0.65 + rnd() * 0.55)
-          .normalize();
-        const p = anchor
-          .clone()
-          .addScaledVector(side, spread * (0.45 + rnd() * 0.7));
-        addLeaf(p, anchor, twigRadius);
-      }
-    };
-
-    // Size-STABLE density: budgets grow with the crown span (no hard ceiling
-    // that would starve a tall tree of leaves) — the tier scales via BS.
-    let budget = Math.round(THREE.MathUtils.clamp(span, 4, 26) * 420 * BS);
-    const grow = (
-      pos: THREE.Vector3,
-      dir: THREE.Vector3,
-      len: number,
-      rad: number,
-      depth: number,
-    ) => {
-      if (budget-- <= 0) return;
-      const end = pos.clone().addScaledVector(dir, len);
-      end.y -= Math.max(0, 1 - rad * 6) * len * 0.14;
-      if (blocked(end, rad * 3 + 0.25)) return;
-      const mid = pos.clone().addScaledVector(dir, len * 0.5);
-      branchGeos.push(makeTaperedTubeGeometry([pos, mid, end], rad, rad * 0.66, 3, 4, seed * 0.7));
-      if (depth <= 0 || len < 0.34) {
-        addLeafBurst(end, dir, 14, 0.48, rad * 0.16);
-        return;
-      }
-      // Add denser foliage on thinner outer twigs.
-      if (depth <= 3) addLeafBurst(end, dir, 2, 0.18, rad * 0.22);
-      if (depth <= 2) addLeafBurst(end, dir, 3, 0.26, rad * 0.2);
-      if (depth <= 1) addLeafBurst(end, dir, 8, 0.4, rad * 0.18);
-      const n = depth >= 3 ? (rnd() < 0.5 ? 3 : 2) : 2;
-      for (let c = 0; c < n; c++) {
-        grow(end, childDir(dir, 0.3 + rnd() * 0.4), len * (0.62 + rnd() * 0.16), rad * 0.68, depth - 1);
-      }
-    };
-
-    // Main crown shell — scales with span so big trees stay just as lush.
-    const NC = Math.max(90, Math.round((span * 7.5 + 50) * BS));
-    for (let i = 0; i < NC; i++) {
-      const v = i / Math.max(1, NC - 1);
-      const ty = cBot + v * (apexY - cBot) + (rnd() - 0.5) * 0.9;
-      const cap = Math.pow(Math.max(0, (v - 0.85) / 0.15), 2);
-      const domeR = cRX * (0.5 + 0.5 * Math.min(1, v * 1.2)) * (1 - 0.5 * cap);
-      const a = i * GA + rnd() * 0.5;
-      const rr = 0.5 + 0.5 * Math.sqrt(rnd());
-      const target = new THREE.Vector3(Math.cos(a) * domeR * rr, ty, Math.sin(a) * domeR * rr);
-      if (blocked(target, 0.7)) continue;
-      const oy = THREE.MathUtils.clamp(ty - 1.0 - rnd() * 1.0, cBot - 0.5, trunkTopY);
-      const sp = spineAt(oy);
-      const dir = target.clone().sub(sp);
-      if (dir.lengthSq() < 0.01) continue;
-      dir.normalize();
-      grow(sp, dir, 1.8 + rnd() * 0.65, 0.09, 5);
-    }
-    // Leaf collars around active platforms.
-    for (let i = 0; i < active; i++) {
-      const base = nodes[i].base;
-      const tip = nodes[i].tip;
-      const dr = deckRadius(i, stargazers);
-      const RING = 8;
-      for (let k = 0; k < RING; k++) {
-        const a = (k / RING) * Math.PI * 2 + i * 1.3;
-        const o = tip
-          .clone()
-          .add(new THREE.Vector3(Math.cos(a) * dr * 1.04, -0.25 + rnd() * 0.3, Math.sin(a) * dr * 1.04));
-        const out = new THREE.Vector3(Math.cos(a) * 0.85, 0.45 + rnd() * 0.6, Math.sin(a) * 0.85).normalize();
-        grow(o, out, 1.15 + rnd() * 0.65, 0.06, 3);
-      }
-      // Add a small leafy backdrop behind each deck.
-      for (let k = 0; k < 3; k++) {
-        const a = i * 1.3 + k * 1.7;
-        const o = tip
-          .clone()
-          .add(new THREE.Vector3(Math.cos(a) * dr * 1.08, 0.1, Math.sin(a) * dr * 1.08));
-        grow(o, new THREE.Vector3(Math.cos(a) * 0.35, 1, Math.sin(a) * 0.35).normalize(), 1.65 + rnd() * 0.65, 0.055, 3);
-      }
-    }
-    // Dense tip canopy around the upper trunk.
-    for (let k = 0; k < 14; k++) {
-      const a = k * GA + 0.3;
-      const o = spineAt(trunkTopY - rnd() * 1.6);
-      const out = new THREE.Vector3(Math.cos(a), 0.25 + rnd() * 0.7, Math.sin(a)).normalize();
-      grow(o, out, 0.9 + rnd() * 0.75, 0.05, 3);
-    }
-    const tipBase = spineAt(trunkTopY);
-    for (let k = 0; k < 16; k++) {
-      const p = tipBase
-        .clone()
-        .add(new THREE.Vector3((rnd() - 0.5) * 1.3, rnd() * 1.5 - 0.2, (rnd() - 0.5) * 1.3));
-      addLeaf(p, tipBase, 0.024);
-    }
-
-    // Inner rosette that covers the trunk from top-down views.
-    for (let layer = 0; layer < 5; layer++) {
-      const lt = layer / 4;
-      const center = spineAt(trunkTopY - 0.7 + lt * 2.2);
-      const ring = 14 + layer * 3;
-      for (let k = 0; k < ring; k++) {
-        const a = k * GA + layer * 0.58;
-        const radius = THREE.MathUtils.lerp(0.45, 2.55, lt) * (0.75 + rnd() * 0.5);
-        const p = center.clone().add(
-          new THREE.Vector3(
-            Math.cos(a) * radius,
-            (rnd() - 0.25) * 0.45,
-            Math.sin(a) * radius,
-          ),
-        );
-        addLeaf(p, center, 0.026);
-        if (k % 2 === 0) {
-          const out = p.clone().sub(center);
-          if (out.lengthSq() > 0.01) addLeafBurst(p, out.normalize(), 3, 0.3, 0.016);
-        }
-      }
-    }
-
-    // Central canopy plug for the top-down camera.
-    const plugLayers = 6;
-    for (let layer = 0; layer < plugLayers; layer++) {
-      const lt = layer / (plugLayers - 1);
-      const y = THREE.MathUtils.lerp(cBot + span * 0.48, apexY + 0.55, lt);
-      const center = spineAt(y);
-      const ring = 12 + Math.round(lt * 14);
-      const maxR = THREE.MathUtils.lerp(0.8, 3.0, Math.sin(lt * Math.PI));
-      for (let k = 0; k < ring; k++) {
-        const a = k * GA + layer * 0.41 + rnd() * 0.12;
-        const inner = k % 5 === 0 ? 0.05 + rnd() * 0.18 : 0.22 + rnd() * maxR;
-        const p = center.clone().add(
-          new THREE.Vector3(
-            Math.cos(a) * inner,
-            (rnd() - 0.35) * 0.5,
-            Math.sin(a) * inner,
-          ),
-        );
-        addLeaf(p, center, 0.022);
-        if (k % 3 === 0) {
-          const out = p.clone().sub(center);
-          if (out.lengthSq() > 0.01) addLeafBurst(p, out.normalize(), 2, 0.24, 0.014);
-        }
-      }
-    }
-
-    // Layered radial branches around the upper trunk.
-    const sleeveLayers = 5;
-    for (let layer = 0; layer < sleeveLayers; layer++) {
-      const ly = THREE.MathUtils.lerp(trunkTopY - 2.3, trunkTopY + 1.7, layer / (sleeveLayers - 1));
-      const center = spineAt(ly);
-      const ring = layer < 2 ? 12 : 16;
-      const layerT = layer / (sleeveLayers - 1);
-      const baseReach = THREE.MathUtils.lerp(2.2, 4.3, Math.sin(layerT * Math.PI));
-      for (let k = 0; k < ring; k++) {
-        const a = k * GA + layer * 0.73 + rnd() * 0.18;
-        const reach = baseReach * (0.72 + rnd() * 0.45);
-        const out = new THREE.Vector3(
-          Math.cos(a) * reach,
-          -0.08 + rnd() * 0.55 + layerT * 0.25,
-          Math.sin(a) * reach,
-        );
-        const target = center.clone().add(out);
-        if (blocked(target, 0.9)) continue;
-        const dir = target.clone().sub(center);
-        if (dir.lengthSq() < 0.01) continue;
-        grow(center, dir.normalize(), 1.05 + rnd() * 0.45, 0.05, 3);
-      }
-    }
-
-    // Apex fill uses supported twig growth, not loose leaves.
-    const topStart = cBot + span * 0.55;
-    const NF = Math.max(80, Math.round(span * 12 * BS));
-    for (let i = 0; i < NF; i++) {
-      const ty = topStart + (i / Math.max(1, NF - 1)) * (apexY + 0.8 - topStart) + (rnd() - 0.5) * 0.8;
-      const vv = THREE.MathUtils.clamp((ty - cBot) / span, 0, 1);
-      const cap = Math.pow(Math.max(0, (vv - 0.85) / 0.15), 2);
-      const domeR = cRX * (0.5 + 0.5 * Math.min(1, vv * 1.2)) * (1 - 0.5 * cap);
-      const a = i * GA + rnd() * 0.6;
-      const rr = 0.35 + 0.65 * Math.sqrt(rnd());
-      const target = new THREE.Vector3(Math.cos(a) * domeR * rr, ty, Math.sin(a) * domeR * rr);
-      if (blocked(target, 0.7)) continue;
-      const oy = THREE.MathUtils.clamp(ty - 0.8 - rnd() * 1.5, cBot, trunkTopY);
-      const sp = spineAt(oy);
-      const dir = target.clone().sub(sp);
-      if (dir.lengthSq() < 0.01) continue;
-      grow(sp, dir.normalize(), 1.35 + rnd() * 0.55, 0.058, 4);
-    }
-
-    // Inner-volume fill: plain sprigs INSIDE the hull (no twig geometry) so
-    // the crown reads as a solid mass when the camera dives in or orbits low —
-    // without it the shell is visibly hollow.
-    const NI = Math.round(NC * 0.35);
-    for (let i = 0; i < NI; i++) {
-      const vv = 0.15 + 0.75 * rnd();
-      const ty = cBot + vv * span;
-      const cap = Math.pow(Math.max(0, (vv - 0.85) / 0.15), 2);
-      const domeR = cRX * (0.5 + 0.5 * Math.min(1, vv * 1.2)) * (1 - 0.5 * cap);
-      const a = i * GA + rnd() * 0.7;
-      const rr = 0.25 + 0.4 * rnd();
-      const c = spineAt(ty);
-      addLeaf(
-        new THREE.Vector3(c.x + Math.cos(a) * domeR * rr, ty, c.z + Math.sin(a) * domeR * rr),
-      );
-    }
-
-    const branchGeo = branchGeos.length ? mergeGeometries(branchGeos, false) : null;
-    return { branchGeo, sprigs };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- tierKey captures the only stargazer data used (deck tiers)
-  }, [nodes, active, stars, sprigDensity, quality.canopyBudgetScale, tierKey]);
-
+  const firstBranchRun = useRef(true);
   useEffect(() => {
+    const skipIntro = firstBranchRun.current && growIntroPlayed;
+    firstBranchRun.current = false;
     branchRefs.current.forEach((group, i) => {
       if (!group) return;
       const on = i < active;
+      if (skipIntro) {
+        group.visible = on;
+        group.scale.setScalar(on ? 1 : 0.001);
+        return;
+      }
       if (on) group.visible = true;
       gsap.to(group.scale, {
         x: on ? 1 : 0.001,
@@ -1275,6 +860,7 @@ export function Tree({
         duration: on ? 0.85 : 0.35,
         delay: on ? i * 0.025 : 0,
         ease: on ? "back.out(1.35)" : "power2.in",
+        overwrite: true,
         onComplete: () => {
           if (!on) group.visible = false;
         },
@@ -1309,9 +895,14 @@ export function Tree({
     // rotation loop per frame; branchRefs only drive the grow-in animation.
   });
 
+  // Must stay after the grow effects above so they still see the first mount.
+  useEffect(() => {
+    growIntroPlayed = true;
+  }, []);
+
   // Small intro settle without changing platform spacing.
   const { scale } = useSpring({
-    from: { scale: 0.92 },
+    from: { scale: growIntroPlayed ? 1 : 0.92 },
     to: { scale: 1 },
     config: { mass: 1, tension: 110, friction: 25 },
   });
@@ -1322,7 +913,7 @@ export function Tree({
       <group ref={swayRef}>
         <group ref={trunkRef}>
           <mesh geometry={woodGeos.bark} material={materials.bark} castShadow receiveShadow />
-          <mesh geometry={woodGeos.roots} material={materials.barkDark} castShadow receiveShadow />
+          <mesh geometry={woodGeos.roots} material={materials.bark} castShadow receiveShadow />
           {woodGeos.caps && (
             <mesh geometry={woodGeos.caps} material={materials.ringCap} castShadow />
           )}
@@ -1344,9 +935,9 @@ export function Tree({
 
         {/* Merged procedural branch skeleton (casts twig shadows between the
             leaf dapples when real shadows are on — it is ONE mesh). */}
-        {active > 0 && crownStructure.branchGeo && (
+        {active > 0 && canopyBranches && (
           <mesh
-            geometry={crownStructure.branchGeo}
+            geometry={canopyBranches}
             material={materials.bark}
             castShadow={realShadows}
           />
@@ -1354,11 +945,12 @@ export function Tree({
 
         {/* Instanced canopy leaves. */}
         <LeafClumps
-          clumps={crownStructure.sprigs}
+          sprigs={canopy.sprigs}
           geometry={sprigGeo}
           material={materials.leaf}
           depthMaterial={realShadows ? leafDepthMaterial : undefined}
           grown={active > 0}
+          density={leafDensity}
           castShadow={realShadows}
           receiveShadow={realShadows && quality.canopySelfShadow}
         />

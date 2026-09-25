@@ -13,21 +13,18 @@ import { useQualityProfile } from "@/lib/quality";
 // whole scene out white.
 export function SceneRig({
   params,
-  shadowsActive = true,
   fogScale = 1,
 }: {
   params: SceneParams;
-  shadowsActive?: boolean;
   fogScale?: number;
 }) {
-  const { gl, scene } = useThree();
+  const scene = useThree((s) => s.scene);
   const quality = useQualityProfile();
   // The shadow frustum must wrap the grown crown too, but growing it costs
   // shadow-map texel density — cap it below the fog reach.
   const shadowScale = Math.min(fogScale, 2);
   const hemi = useRef<THREE.HemisphereLight>(null);
   const dir = useRef<THREE.DirectionalLight>(null);
-  const lastShadowUpdate = useRef(-1);
   const target = useRef({
     bg: new THREE.Color(),
     fog: new THREE.Color(),
@@ -56,7 +53,7 @@ export function SceneRig({
       params.fogFar,
     );
 
-  useFrame((state, dt) => {
+  useFrame((_, dt) => {
     const k = Math.min(1, dt * 1.4);
     const c = cur.current;
     const next = target.current;
@@ -90,19 +87,6 @@ export function SceneRig({
       hemi.current.intensity = c.hemiI;
       c.sky.lerp(next.sky.set(params.skyColor), k);
       hemi.current.color.copy(c.sky);
-    }
-
-    gl.shadowMap.autoUpdate = false;
-    // With real leaf shadows a storm should visibly move the dapples, so the
-    // refresh tightens under strong wind; calm scenes keep the cheap cadence.
-    const shadowInterval =
-      quality.leafShadows === "real" && params.wind > 1.2 ? 0.22 : 0.45;
-    if (
-      shadowsActive &&
-      state.clock.elapsedTime - lastShadowUpdate.current > shadowInterval
-    ) {
-      gl.shadowMap.needsUpdate = true;
-      lastShadowUpdate.current = state.clock.elapsedTime;
     }
   });
 

@@ -5,39 +5,26 @@ import { useFrame, useThree } from "@react-three/fiber";
 import { CapsuleCollider, RigidBody, useRapier, type RapierRigidBody } from "@react-three/rapier";
 import * as THREE from "three";
 import { bonsaiNodes } from "@/lib/bonsai";
-import type { Stargazer } from "@/lib/stargazers";
+import { TREE_BOOST, TREE_Y } from "@/lib/scene";
 
-// First-person WALK explorer backed by REAL rigidbody physics
-// (@react-three/rapier), using rapier's own KinematicCharacterController —
-// NOT a hand-rolled velocity/raycast hack. The controller's `enableAutostep`
-// climbs stair-riser-height obstacles automatically (so the spiral staircase
-// in Bridges.tsx is climbed via plain WASD, no special "climb mode"),
-// `enableSnapToGround` keeps the character glued to stepped/sloped ground
-// instead of repeatedly losing and regaining contact (the previous
-// raycast-grounded-check + manual setTranslation steering was the source of
-// the jitter/"things moving" bug — it fought the real collider every frame).
-// The capsule is a kinematic body: we compute the desired move, ask the
-// controller to resolve it against the real trimesh colliders (slide along
-// walls, stop at steps too tall, etc.), then commit the RESULT. Mouse-look
-// only ever rotates the camera — the capsule itself never rotates.
+// First-person walk mode on top of rapier's KinematicCharacterController. Each
+// frame the desired move is resolved against the scene colliders (slide along
+// walls, autostep over rungs, snap to ground) and the result is committed to a
+// kinematic capsule. Mouse-look only rotates the camera, never the capsule.
 
 const EULER_ORDER = "YXZ";
 const PITCH_LIMIT = Math.PI / 2 - 0.08;
-const ISLAND_SCALE = 0.8; // must match Experience.ISLAND_SCALE
-const TREE_Y = 7.35 * ISLAND_SCALE; // must match Experience.TREE_Y
-const TREE_BOOST = 1.15; // must match Experience.TREE_BOOST
 const CAPSULE_R = 0.3;
 const CAPSULE_HALF_H = 0.575; // total capsule height = 2*(half+R) ≈ 1.75, human-scale
 const EYE_OFFSET = CAPSULE_HALF_H + CAPSULE_R - 0.15; // camera near the top of the capsule
 const JUMP_VEL = 6.5;
 const GRAVITY = 26;
 const INTRO_SECONDS = 3.4;
-const RESPAWN_Y = -60; // fell into the void (walked off an edge) — real physics allows this now
-// Spawn stays this far from the trunk at most — comfortably inside the island
-// floor collider (radius 12.5 in Experience.tsx) so gravity never drops the
-// player off the edge on spawn. Near the trunk = near the ladder to climb up.
+const RESPAWN_Y = -60; // below this the player fell off the island
+// Max spawn distance from the trunk: well inside the island floor collider
+// (radius 12.5 in Experience.tsx) and close to the ladder up the tree.
 const SPAWN_RADIUS = 5;
-const FLY_SPEED = 10; // horizontal speed while flying — a bit faster than walking, Minecraft-style
+const FLY_SPEED = 10; // horizontal speed while flying
 const FLY_VERTICAL_SPEED = 7.5; // Space = up, Shift = down while flying
 const DOUBLE_TAP_MS = 320; // window for the double-Space fly toggle
 
@@ -59,13 +46,11 @@ export function WalkControls({
   speed = 6,
   lookSpeed = 0.0019,
   stars = 0,
-  stargazers = null,
   onIntroChange,
 }: {
   speed?: number;
   lookSpeed?: number;
   stars?: number;
-  stargazers?: Stargazer[] | null;
   onIntroChange?: (introing: boolean) => void;
 }) {
   const { camera, gl } = useThree();
@@ -75,8 +60,8 @@ export function WalkControls({
 
   useEffect(() => {
     const controller = world.createCharacterController(0.03);
-    // Max step height comfortably clears a ladder rung (RUNG_PITCH in
-    // Bridges.tsx) — walking straight into one steps you up automatically.
+    // Step height clears a ladder rung (RUNG_PITCH in Bridges.tsx), so walking
+    // into a ladder climbs it.
     controller.enableAutostep(0.42, 0.2, true);
     controller.enableSnapToGround(0.35);
     controller.setSlideEnabled(true);
@@ -99,7 +84,7 @@ export function WalkControls({
       z: n.tip.z * TREE_BOOST,
       y: TREE_Y + (n.tip.y + 0.35) * TREE_BOOST,
     };
-  }, [stars, stargazers]);
+  }, [stars]);
 
   const keys = useRef(new Set<string>());
   const dragging = useRef(false);
@@ -120,8 +105,8 @@ export function WalkControls({
   const vy = useRef(0);
   const grounded = useRef(true);
   const desired = useRef(new THREE.Vector3());
-  // Minecraft-style creative flight: double-tap Space toggles it, gravity is
-  // suspended while active, Space/Shift move straight up/down.
+  // Creative flight: double-tap Space toggles it, gravity is suspended while
+  // active, Space/Shift move straight up/down.
   const flying = useRef(false);
   const lastSpaceTapAt = useRef(0);
 
@@ -139,12 +124,8 @@ export function WalkControls({
   const onIntroChangeRef = useRef(onIntroChange);
   onIntroChangeRef.current = onIntroChange;
 
-  // Whenever the intro hands off — whether it finished naturally OR got
-  // cancelled early by a keypress — the look state MUST be resynced from
-  // wherever the camera actually ended up. Skipping this (previously only
-  // ran on natural completion) left yaw/pitch at their stale mount-time
-  // value, so an early-cancelled intro snapped the camera to a wrong facing
-  // the instant normal control took over.
+  // When the intro hands off (finished or skipped by a keypress), resync the
+  // look angles from wherever the camera ended up so control doesn't snap.
   const syncLookFromCamera = () => {
     euler.current.setFromQuaternion(camera.quaternion, EULER_ORDER);
     yaw.current = smoothYaw.current = euler.current.y;
@@ -156,19 +137,12 @@ export function WalkControls({
     const dev = founderDeck;
     if (dev) {
       const dr = Math.hypot(dev.x, dev.z) || 1;
-      // Spawn ON the island ground near the trunk, in the founder's compass
-      // direction, at a SAFE radius clamped well inside the island's collision
-      // radius (ISLAND_COLLIDER_R). The previous spawn pushed the player OUT
-      // to radius ≈ founderRadius + 6 (~12.6), which landed them PAST the
-      // island floor collider (radius 12.5) — so gravity dropped them straight
-      // into the void the instant the intro handed off ("man fällt runter").
-      // Clamped short of the edge, they always settle onto solid ground and
-      // can walk to the ladder at the trunk base.
+      // Spawn on the ground in the founder's direction, clamped well inside
+      // the island floor collider so the player always lands on solid ground.
       const safeR = Math.min(dr, SPAWN_RADIUS);
       const sx = (dev.x / dr) * safeR;
       const sz = (dev.z / dr) * safeR;
-      // Low enough to settle almost immediately, high enough to clear the
-      // grass/plateau so gravity resolves the exact contact for real.
+      // Just above the plateau; gravity settles the exact contact.
       spawnPos.current.set(sx, TREE_Y + 2, sz);
       introTarget.current.set(dev.x, dev.y - 0.6, dev.z);
       introStart.current.set(dev.x * 1.9, dev.y + 7.5, dev.z * 1.9);
@@ -215,10 +189,8 @@ export function WalkControls({
         onIntroChangeRef.current?.(false);
         syncLookFromCamera();
       }
-      // Double-tap Space toggles creative-style flight (Minecraft) — only on
-      // the real first press of a tap, not the browser's key-repeat while
-      // held, and never on the SAME keypress that just cancelled the intro
-      // (that press was consumed as "stop the cinematic", not a fly-tap).
+      // Double-tap Space toggles flight. Ignores key-repeat and the keypress
+      // that skipped the intro.
       if (e.code === "Space" && !e.repeat && !wasIntroing) {
         const now = performance.now();
         if (now - lastSpaceTapAt.current < DOUBLE_TAP_MS) {
@@ -332,7 +304,7 @@ export function WalkControls({
 
     const pos = body.translation();
 
-    // Fell off an edge into the void (real physics allows this now) — respawn.
+    // Fell off the island: respawn.
     if (pos.y < RESPAWN_Y) {
       setup();
       return;
@@ -363,14 +335,12 @@ export function WalkControls({
     const shiftPressed = keys.current.has("ShiftLeft") || keys.current.has("ShiftRight");
 
     if (flying.current) {
-      // ---- Minecraft-style creative flight: no gravity, Space/Shift move
-      // straight up/down, eased the same way horizontal speed is. ----
+      // Flight: no gravity, Space/Shift move straight up/down.
       const vTarget = (spacePressed ? 1 : 0) - (shiftPressed ? 1 : 0);
       vy.current += (vTarget * FLY_VERTICAL_SPEED - vy.current) * speedK;
     } else {
-      // ---- gravity + jump, integrated manually (the character controller
-      // has no built-in gravity — it only RESOLVES a desired delta against
-      // obstacles) ----
+      // Gravity and jump are integrated here; the character controller only
+      // resolves the desired delta against obstacles.
       if (grounded.current && vy.current < 0) vy.current = 0;
       if (spacePressed && grounded.current) vy.current = JUMP_VEL;
       else vy.current -= GRAVITY * d;

@@ -137,11 +137,6 @@ const LEAF_COLOR: Record<Season, string> = {
 const lerp = THREE.MathUtils.lerp;
 const clamp = THREE.MathUtils.clamp;
 
-function pct(n: number | undefined, fallback = 0): number {
-  if (typeof n !== "number" || !Number.isFinite(n)) return fallback;
-  return clamp(n / 100, 0, 1);
-}
-
 function finite(n: number | undefined, fallback: number): number {
   return typeof n === "number" && Number.isFinite(n) ? n : fallback;
 }
@@ -393,8 +388,8 @@ export function sceneFromWeather(w: Weather): SceneParams {
     sunPos: pos,
     sunIntensity,
     sunColor,
-    // The physical sky color is brighter than the old artistic hex values, so
-    // the hemisphere intensity is scaled down to keep the same light energy.
+    // The physical sky color is bright, so the hemisphere intensity is kept
+    // low to hold a sensible light energy.
     ambient: (lerp(0.12, 0.36, day) + totalCloud * 0.05) * lerp(1, 0.72, rainMood),
     skyColor: linearToHex(skyCol),
     fogColor: linearToHex(fogCol),
@@ -504,4 +499,3 @@ export function weatherFromApiPayload(payload: Record<string, unknown>): Weather
   };
 }
 
-export { pct };

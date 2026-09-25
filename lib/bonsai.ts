@@ -9,11 +9,10 @@ const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 // platforms close enough in height that they link with walkable BRIDGE ramps
 // rather than tall ladders.
 const HELIX_R = 5.35; // base horizontal radius of the platform helix (innermost)
-// Keep the radius nearly CONSTANT as it climbs so the upper tree reads like the
-// lower tree — a tidy column around the trunk, not thin towers fanning off into
-// space (owner's "build it upward like it is at the bottom"). A gentle √i spread
-// keeps it from looking perfectly cylindrical without breaking the column.
-const SPREAD_R = 0.5; // very mild outward fan with height (was a wide broadening)
+// Keep the radius nearly constant as it climbs so the upper tree reads like the
+// lower tree: a tidy column around the trunk, not thin towers fanning off into
+// space. A gentle √i spread keeps it from looking perfectly cylindrical.
+const SPREAD_R = 0.5; // very mild outward fan with height
 const Y0 = 3.2; // height of the first (founder) platform — lifted clear of the ground
 const PITCH = 1.15; // base vertical rise per platform (low → broad spiral, not a tower)
 const GAP_K = 0.14; // extra rise scaled by deck radii (radial spread does the rest)
@@ -105,6 +104,78 @@ export function bonsaiAnchors(count: number): BonsaiAnchor[] {
   return bonsaiNodes(count).map((node) => ({ pos: node.tip.clone() }));
 }
 
+// three's CatmullRomCurve3 recomputes a segment's cubic coefficients on every
+// getPoint() call, and a tube samples its curve ~40 times (arc-length table,
+// points, tangents). This subclass computes them once per segment. It repeats
+// three's arithmetic step for step for open centripetal curves (the only kind
+// used here), so the results are bit-identical.
+class SegmentCachedCurve extends THREE.CatmullRomCurve3 {
+  private coefficients: Float64Array[] = [];
+
+  override getPoint(t: number, optionalTarget = new THREE.Vector3()): THREE.Vector3 {
+    const l = this.points.length;
+    const p = (l - 1) * t;
+    let intPoint = Math.floor(p);
+    let weight = p - intPoint;
+    if (weight === 0 && intPoint === l - 1) {
+      intPoint = l - 2;
+      weight = 1;
+    }
+    const c = (this.coefficients[intPoint] ??= this.segmentCoefficients(intPoint));
+    const t2 = weight * weight;
+    const t3 = t2 * weight;
+    return optionalTarget.set(
+      c[0] + c[1] * weight + c[2] * t2 + c[3] * t3,
+      c[4] + c[5] * weight + c[6] * t2 + c[7] * t3,
+      c[8] + c[9] * weight + c[10] * t2 + c[11] * t3,
+    );
+  }
+
+  private segmentCoefficients(i: number): Float64Array {
+    const pts = this.points;
+    const l = pts.length;
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    // Open curve: the missing outer neighbours are extrapolated like three does.
+    const p0 = i > 0 ? pts[i - 1] : new THREE.Vector3().subVectors(pts[0], pts[1]).add(pts[0]);
+    const p3 =
+      i + 2 < l ? pts[i + 2] : new THREE.Vector3().subVectors(pts[l - 1], pts[l - 2]).add(pts[l - 1]);
+    let dt0 = Math.pow(p0.distanceToSquared(p1), 0.25);
+    let dt1 = Math.pow(p1.distanceToSquared(p2), 0.25);
+    let dt2 = Math.pow(p2.distanceToSquared(p3), 0.25);
+    if (dt1 < 1e-4) dt1 = 1.0;
+    if (dt0 < 1e-4) dt0 = dt1;
+    if (dt2 < 1e-4) dt2 = dt1;
+    const out = new Float64Array(12);
+    nonuniformCubic(out, 0, p0.x, p1.x, p2.x, p3.x, dt0, dt1, dt2);
+    nonuniformCubic(out, 4, p0.y, p1.y, p2.y, p3.y, dt0, dt1, dt2);
+    nonuniformCubic(out, 8, p0.z, p1.z, p2.z, p3.z, dt0, dt1, dt2);
+    return out;
+  }
+}
+
+// CubicPoly.initNonuniformCatmullRom from three.js, writing c0..c3 into `out`.
+function nonuniformCubic(
+  out: Float64Array,
+  o: number,
+  x0: number,
+  x1: number,
+  x2: number,
+  x3: number,
+  dt0: number,
+  dt1: number,
+  dt2: number,
+) {
+  let t1 = (x1 - x0) / dt0 - (x2 - x0) / (dt0 + dt1) + (x2 - x1) / dt1;
+  let t2 = (x2 - x1) / dt1 - (x3 - x1) / (dt1 + dt2) + (x3 - x2) / dt2;
+  t1 *= dt1;
+  t2 *= dt1;
+  out[o] = x1;
+  out[o + 1] = t1;
+  out[o + 2] = -3 * x1 + 3 * x2 - 2 * t1 - t2;
+  out[o + 3] = 2 * x1 - 2 * x2 + t1 + t2;
+}
+
 export function makeTaperedTubeGeometry(
   points: THREE.Vector3[],
   radiusStart: number,
@@ -114,20 +185,34 @@ export function makeTaperedTubeGeometry(
   barkTwist = 0,
   irregularity = 0,
 ): THREE.BufferGeometry {
-  const curve = new THREE.CatmullRomCurve3(points);
-  const positions: number[] = [];
-  const normals: number[] = [];
-  const uvs: number[] = [];
+  const curve = new SegmentCachedCurve(points);
+  // getPointAt() builds an arc-length table first (200 samples by default).
+  // The canopy creates thousands of 3-segment twigs, where that table was
+  // most of the tree's build time; 8 samples per segment is accurate to
+  // well under a millimetre.
+  curve.arcLengthDivisions = Math.min(200, Math.max(16, tubularSegments * 8));
+  // Written straight into typed arrays with reused scratch vectors: the canopy
+  // builds ~100k of these tubes, and per-vertex allocations dominated the cost.
+  const vertexCount = (tubularSegments + 1) * (radialSegments + 1);
+  const positions = new Float32Array(vertexCount * 3);
+  const normals = new Float32Array(vertexCount * 3);
+  const uvs = new Float32Array(vertexCount * 2);
   const indices: number[] = [];
   const up = new THREE.Vector3(0, 1, 0);
   const fallback = new THREE.Vector3(1, 0, 0);
-  let normal = new THREE.Vector3();
+  const normal = new THREE.Vector3();
   const binormal = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  const tangent = new THREE.Vector3();
+  const ring = new THREE.Vector3();
+  const p = new THREE.Vector3();
+  let v3 = 0;
+  let v2 = 0;
 
   for (let i = 0; i <= tubularSegments; i++) {
     const u = i / tubularSegments;
-    const center = curve.getPointAt(u);
-    const tangent = curve.getTangentAt(u).normalize();
+    curve.getPointAt(u, center);
+    curve.getTangentAt(u, tangent).normalize();
     if (i === 0) {
       normal.crossVectors(tangent, up);
       if (normal.lengthSq() < 0.0001) normal.copy(fallback);
@@ -159,15 +244,18 @@ export function makeTaperedTubeGeometry(
             along * 0.07 +
             flare * flare * (0.5 + 0.5 * Math.sin(a * 4 + barkTwist)) * 0.4);
       }
-      const ring = normal
-        .clone()
-        .multiplyScalar(Math.cos(a))
-        .addScaledVector(binormal, Math.sin(a))
-        .normalize();
-      const p = center.clone().addScaledVector(ring, radius * ridge);
-      positions.push(p.x, p.y, p.z);
-      normals.push(ring.x, ring.y, ring.z);
-      uvs.push(u, v);
+      ring.copy(normal).multiplyScalar(Math.cos(a)).addScaledVector(binormal, Math.sin(a)).normalize();
+      p.copy(center).addScaledVector(ring, radius * ridge);
+      positions[v3] = p.x;
+      positions[v3 + 1] = p.y;
+      positions[v3 + 2] = p.z;
+      normals[v3] = ring.x;
+      normals[v3 + 1] = ring.y;
+      normals[v3 + 2] = ring.z;
+      uvs[v2] = u;
+      uvs[v2 + 1] = v;
+      v3 += 3;
+      v2 += 2;
     }
   }
 
@@ -183,9 +271,9 @@ export function makeTaperedTubeGeometry(
   }
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
-  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+  geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
   geo.setIndex(indices);
   // Keep the analytic outward ring-normals (recomputing from the displaced,
   // seam-duplicated tube could flip/zero them and make a side go dark/invisible).

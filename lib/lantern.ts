@@ -1,7 +1,18 @@
 import * as THREE from "three";
+import { freezeTransforms } from "./matrixUpdates";
 
 // One uniform lantern size everywhere (decks + bridges) so they all match.
 export const LANTERN_SIZE = 1.45;
+
+// Lantern point lights are only switched on (visible) while it's dark. Every
+// lit material evaluates every visible point light per pixel, even at
+// intensity 0, so leaving them on all day was pure waste. Flipping them changes
+// the shader variant of each lit material; Experience precompiles the other
+// variant by this name so dusk and dawn don't freeze.
+export const NIGHT_LIGHT = "night-light";
+
+/** Night factor above which the lanterns cast real light. */
+export const LANTERN_LIGHT_THRESHOLD = 0.04;
 
 // Clone the lantern model, make it glow warmly (emissive), and normalize it to
 // `target` (by its largest dimension) with the base at y=0. `rotX` lets callers
@@ -35,6 +46,8 @@ export function buildLantern(
   g.add(inner);
   g.scale.setScalar(target / (Math.max(size.x, size.y, size.z) || 1));
   inner.position.set(-center.x, -box.min.y, -center.z);
+  // Lanterns only sway through their parent groups; their own nodes are static.
+  freezeTransforms(g);
   return g;
 }
 

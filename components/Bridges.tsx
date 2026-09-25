@@ -6,12 +6,17 @@ import { useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { MAX_HOUSES } from "@/lib/layout";
-import { sampleBranchAnchors } from "@/lib/branches";
-import { buildLantern, setLanternGlow, LANTERN_SIZE } from "@/lib/lantern";
+import { bonsaiAnchors } from "@/lib/bonsai";
+import {
+  buildLantern,
+  setLanternGlow,
+  LANTERN_LIGHT_THRESHOLD,
+  LANTERN_SIZE,
+  NIGHT_LIGHT,
+} from "@/lib/lantern";
 import { TIER_SIZE, resolveTier } from "@/lib/rarity";
 import type { Stargazer } from "@/lib/stargazers";
 
-const BRIDGE = "/models/suspension_bridge.glb";
 const LANTERN = "/models/stylized_lantern.glb";
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
 const DECK = 0.35; // platform deck top above the raw branch anchor (matches Houses)
@@ -85,12 +90,9 @@ const LADDER_WOOD = applyWoodShader(
     roughness: 0.86,
   }),
 );
-// Half-distance between the two rails. MUST clear the walk-mode player
-// capsule (CAPSULE_R=0.3 in WalkControls.tsx → 0.6 diameter): at the old
-// 0.34 the inner clear gap was only ~0.59 — the capsule was wedged almost
-// exactly between the rails, which is why walking felt like an invisible
-// wall blocked every direction (the character controller found it in
-// constant contact with both rails at once). 0.55 leaves ~1.0 clear.
+// Half-distance between the two rails. The gap must clear the walk-mode
+// capsule (CAPSULE_R = 0.3 in WalkControls.tsx, 0.6 wide) with room to spare,
+// or the character controller gets wedged between both rails.
 const RAIL_GAP = 0.55;
 const RUNG_PITCH = 0.34; // constant vertical spacing between rungs (never scaled)
 function makeLadder(length: number): THREE.BufferGeometry {
@@ -116,13 +118,6 @@ function makeLadder(length: number): THREE.BufferGeometry {
   return merged;
 }
 
-// A detailed procedural spiral staircase — central newel post, wedge-shaped
-// treads winding at a FIXED rise/angle pitch (never stretched, more steps for
-// a taller climb), a helix handrail (tube along a sampled curve) and small
-// balusters. This is the ONLY connector from the ground to the first
-// platform (see GROUND below) — the user explicitly prefers it over a ladder
-// for that specific climb. Exported constants let WalkControls.tsx rebuild
-// the exact same step positions for walkable stair-tread collision.
 // A STRAIGHT, flat plank walkway (no sag) built to the exact span length, so it
 // reads as a real, walkable bridge between two decks. Merged → one draw call.
 function makeFlatBridge(length: number): THREE.BufferGeometry {
@@ -166,14 +161,6 @@ function segDistToTrunkXZ(a: THREE.Vector3, b: THREE.Vector3): number {
   return Math.hypot(ax + bx * t, az + bz * t);
 }
 
-type Model = {
-  geo: THREE.BufferGeometry;
-  mat: THREE.Material;
-  len: number;
-  axis: THREE.Vector3;
-  cross: number;
-};
-
 type SpanTransform = {
   visible: boolean;
   position: THREE.Vector3;
@@ -182,44 +169,10 @@ type SpanTransform = {
   lanternPosition: THREE.Vector3;
 };
 
-function extractModel(scene: THREE.Object3D): Model | null {
-  let mesh: THREE.Mesh | null = null;
-  scene.traverse((o) => {
-    if (o instanceof THREE.Mesh && !mesh) mesh = o;
-  });
-  const m = mesh as THREE.Mesh | null;
-  if (!m) return null;
-  const g = m.geometry.clone();
-  g.computeBoundingBox();
-  const c = new THREE.Vector3();
-  g.boundingBox!.getCenter(c);
-  g.translate(-c.x, -c.y, -c.z);
-  const size = new THREE.Vector3();
-  g.boundingBox!.getSize(size);
-  let axis = new THREE.Vector3(1, 0, 0);
-  let len = size.x;
-  let cross = Math.max(size.y, size.z);
-  if (size.y >= size.x && size.y >= size.z) {
-    axis = new THREE.Vector3(0, 1, 0);
-    len = size.y;
-    cross = Math.max(size.x, size.z);
-  } else if (size.z >= size.x && size.z >= size.y) {
-    axis = new THREE.Vector3(0, 0, 1);
-    len = size.z;
-    cross = Math.max(size.x, size.y);
-  }
-  return {
-    geo: g,
-    mat: applyWoodShader((m.material as THREE.Material).clone()),
-    len,
-    axis,
-    cross,
-  };
-}
-
-// Platform-to-platform walkways: a minimum spanning tree connects every deck.
-// Gentle gaps → a suspension bridge (rim-to-rim, with a hanging sag); steep
-// climbs → a ladder; overlapping decks need nothing. Each span carries a lantern.
+// Platform-to-platform walkways: a degree-capped spanning tree connects every
+// deck, plus a ladder from the ground to the first platform. Spans with room
+// get a flat plank bridge, nearly stacked decks a ladder, overlapping decks
+// nothing. Each span carries a lantern.
 export function Bridges({
   stars,
   night = 0,
@@ -229,10 +182,8 @@ export function Bridges({
   night?: number;
   stargazers?: Stargazer[] | null;
 }) {
-  const { scene: bridgeScene } = useGLTF(BRIDGE);
   const { scene: lanternScene } = useGLTF(LANTERN);
-  const anchors = useMemo(() => sampleBranchAnchors(null, MAX_HOUSES), []);
-  const bridge = useMemo(() => extractModel(bridgeScene), [bridgeScene]);
+  const anchors = useMemo(() => bonsaiAnchors(MAX_HOUSES), []);
 
   // Deck radius per house — uses the SAME resolved tier as Houses so the bridge
   // ends land exactly on the deck rims.
@@ -241,14 +192,9 @@ export function Bridges({
     [stargazers],
   );
 
-  // GROUND sits just OUTSIDE platform 0's deck rim (offset radially outward
-  // from the trunk, same direction the deck already extends) rather than
-  // dead-center under it — centered-under hides the whole staircase behind
-  // the deck's own solid floor from every normal viewing angle. Since the
-  // column is built perfectly VERTICAL (straight up from ground to `hiY`),
-  // moving its base X/Z doesn't misalign the top — it still arrives at the
-  // exact same height, just at the edge, right where you'd naturally step
-  // off the last tread onto the deck.
+  // The ground ladder stands just outside platform 0's deck rim (radially
+  // outward) so the deck doesn't hide it; it is vertical, so it still tops
+  // out at the deck height.
   const groundPos = useMemo(() => {
     const p = anchors[0]?.pos;
     if (!p) return new THREE.Vector3(0, 0, 0);
@@ -320,10 +266,8 @@ export function Bridges({
       };
     };
 
-    // 0) The ONE guaranteed connector: island surface → founder platform. Not
-    //    subject to the degree cap or the `.valid` gate below — without this,
-    //    walking up to the tree at all had no path (the old graph only ever
-    //    spanned platform-to-platform).
+    // 0) The one guaranteed connector: island surface → founder platform. It
+    //    bypasses the degree cap and the `.valid` gate below.
     const ground = classify(GROUND, 0);
     out.push([GROUND, 0, ground.ladder]);
     if (active < 2) return out;
@@ -399,11 +343,6 @@ export function Bridges({
         if (i === GROUND || j === GROUND) {
           const platform = i === GROUND ? j : i;
           const hiY = posOf(platform).y + DECK + WALKWAY_RAISE;
-          // Falling back to the plain ladder here — the same makeLadder()
-          // already proven reliable for every other near-vertical span in
-          // this tree. The custom spiral staircase kept having rendering
-          // issues (thin/near-invisible treads) that weren't worth more
-          // iteration when there's already a known-good connector shape.
           return makeLadder(hiY - groundPos.y);
         }
         if (isLadder) {
@@ -434,6 +373,7 @@ export function Bridges({
       }),
     [edges, posOf, radiusOf],
   );
+  useEffect(() => () => spanGeos.forEach((g) => g.dispose()), [spanGeos]);
 
   const transforms = useMemo<SpanTransform[]>(() => {
     const matrix = new THREE.Matrix4();
@@ -573,8 +513,7 @@ export function Bridges({
     for (const lantern of lanterns) setLanternGlow(lantern, 0.2 + night * 2.2);
   }, [lanterns, night]);
 
-  const lightsOn = night > 0.04;
-  if (!bridge) return null;
+  const lightsOn = night > LANTERN_LIGHT_THRESHOLD;
   return (
     <group>
       {edges.map(([i, j], k) => {
@@ -599,10 +538,11 @@ export function Bridges({
               }}
             >
               <primitive object={lantern} />
-              {/* Always mounted: unmounting lights forces a full scene shader
-                  recompile (day/night switch freeze). Intensity 0 is free. */}
+              {/* Stays mounted; only visible at night (see NIGHT_LIGHT). */}
               {k < 5 && (
                 <pointLight
+                  name={NIGHT_LIGHT}
+                  visible={lightsOn}
                   color="#ffb765"
                   position={[0, 0.4, 0]}
                   intensity={lightsOn ? 4.6 * night : 0}
@@ -618,5 +558,4 @@ export function Bridges({
   );
 }
 
-useGLTF.preload(BRIDGE);
 useGLTF.preload(LANTERN);

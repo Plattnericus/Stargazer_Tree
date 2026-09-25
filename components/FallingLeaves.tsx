@@ -101,14 +101,16 @@ export function FallingLeaves({
   );
 
   const geometry = useMemo(makeLeafGeometry, []);
+  // Per-leaf colors come from instanceColor. `vertexColors` must stay off: the
+  // leaf geometry has no color attribute, and WebGL would read the missing
+  // attribute as black.
   const material = useMemo(
     () =>
       new THREE.MeshStandardMaterial({
-        color: "#d48735",
+        color: "#ffffff",
         roughness: 0.86,
         metalness: 0,
         side: THREE.DoubleSide,
-        vertexColors: true,
       }),
     [],
   );

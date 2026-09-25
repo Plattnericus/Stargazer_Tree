@@ -3,14 +3,18 @@
 import * as THREE from "three";
 import type { ResolvedGraphicsQuality } from "./quality";
 
-// Replaces a static cores/memory guess with a real, cheap in-browser probe: a
-// small hidden canvas renders an instanced, wind-shaded quad field (the same
-// cost shape as the real grass material — per-instance sway math + a noisy
-// fragment) for a bounded time budget, and the MEDIAN frame time picks the
-// tier. Falls back to the static heuristic whenever the probe can't produce a
-// trustworthy signal — most importantly when `document.hidden` suppresses
-// requestAnimationFrame entirely (confirmed: an automated/backgrounded tab
-// hangs forever waiting on rAF), so this can NEVER hang the caller.
+// Picks the auto graphics tier with a short in-browser probe: a small hidden
+// canvas renders an instanced, wind-shaded quad field (the same cost shape as
+// the grass material) and the median GPU time per frame picks the tier.
+//
+// Each sample times render() plus a 1-pixel readPixels, which blocks until the
+// GPU has finished the frame. Timing the gap between requestAnimationFrame
+// callbacks instead would only measure the display refresh rate (16.7ms on
+// every 60Hz screen, whatever the GPU).
+//
+// Falls back to a static heuristic whenever the probe can't produce a signal,
+// e.g. in a background tab where requestAnimationFrame never fires, so it can
+// never hang the caller.
 
 const INSTANCE_COUNT = 6000;
 const WARMUP_FRAMES = 3;
@@ -63,14 +67,13 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-function classify(medianFrameMs: number): ResolvedGraphicsQuality {
-  // Thresholds are deliberately conservative: this probe only measures a
-  // simplified wind-shaded quad field, not the real scene's full stack
-  // (shadows, canopy, clouds, ants together) — erring toward a LOWER default
-  // tier for a borderline device is much safer than an optimistic guess that
-  // turns out laggy once everything is actually running.
-  if (medianFrameMs < 6) return "high";
-  if (medianFrameMs < 11) return "medium";
+function classify(medianGpuMs: number): ResolvedGraphicsQuality {
+  // Conservative on purpose: the probe is a small slice of the real scene
+  // (no shadows, canopy, clouds or ants), so a borderline device gets the
+  // lower tier. For reference, an Apple M3 Pro measures ~1.1ms and a software
+  // renderer ~55ms.
+  if (medianGpuMs < 2.5) return "high";
+  if (medianGpuMs < 7) return "medium";
   return "low";
 }
 
@@ -89,6 +92,9 @@ async function probe(): Promise<ResolvedGraphicsQuality | null> {
     geo?.dispose();
     mat?.dispose();
     renderer?.dispose();
+    // Browsers cap live WebGL contexts; release this one right away instead
+    // of waiting for garbage collection.
+    renderer?.forceContextLoss();
     canvas.remove();
   };
 
@@ -119,22 +125,24 @@ async function probe(): Promise<ResolvedGraphicsQuality | null> {
     }
     scene.add(mesh);
 
-    const deltas: number[] = [];
+    const gl = renderer.getContext();
+    const pixel = new Uint8Array(4);
+    const samples: number[] = [];
     let frame = 0;
     const start = performance.now();
 
     await new Promise<void>((resolve) => {
-      let last = performance.now();
       function tick() {
-        const now = performance.now();
-        const dt = now - last;
-        last = now;
-        frame++;
-        if (frame > WARMUP_FRAMES) deltas.push(dt);
+        const t0 = performance.now();
         renderer!.render(scene, camera);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+        const t1 = performance.now();
+        frame++;
+        // The first frames include shader compilation.
+        if (frame > WARMUP_FRAMES) samples.push(t1 - t0);
         if (
-          now - start >= SAMPLE_BUDGET_MS ||
-          deltas.length >= MAX_SAMPLES ||
+          t1 - start >= SAMPLE_BUDGET_MS ||
+          samples.length >= MAX_SAMPLES ||
           document.hidden
         ) {
           resolve();
@@ -146,8 +154,8 @@ async function probe(): Promise<ResolvedGraphicsQuality | null> {
     });
 
     cleanup(geo, mat);
-    if (deltas.length < 5) return null; // inconclusive — not enough real samples
-    return classify(median(deltas));
+    if (samples.length < 5) return null; // inconclusive: not enough samples
+    return classify(median(samples));
   } catch {
     cleanup();
     return null;
@@ -156,8 +164,8 @@ async function probe(): Promise<ResolvedGraphicsQuality | null> {
 
 export async function runGraphicsBenchmark(): Promise<ResolvedGraphicsQuality> {
   const fallback = heuristicFallback();
-  // Hard floors the benchmark can't see (CPU-bound costs like skinned ants) —
-  // always win regardless of what the GPU probe measures.
+  // Hard floors the GPU probe can't see (CPU-bound costs like the skinned
+  // ants) always win.
   if (fallback === "low") return "low";
 
   const result = await Promise.race([
@@ -166,4 +174,33 @@ export async function runGraphicsBenchmark(): Promise<ResolvedGraphicsQuality> {
   ]).catch(() => null);
 
   return result ?? fallback;
+}
+
+const SOFTWARE_RENDERERS = /swiftshader|llvmpipe|softpipe|software|basic render/i;
+
+/**
+ * True when WebGL is rendered on the CPU: hardware acceleration switched off
+ * in the browser, a blocklisted GPU driver, or a VM without a GPU. Browsers
+ * refuse a context with failIfMajorPerformanceCaveat in exactly that case;
+ * the renderer name catches the ones that don't implement the flag.
+ */
+export function detectSoftwareRendering(): boolean {
+  const release = (gl: WebGLRenderingContext | WebGL2RenderingContext) =>
+    gl.getExtension("WEBGL_lose_context")?.loseContext();
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2");
+    // No WebGL 2 at all is a different problem (the scene can't start).
+    if (!gl) return false;
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    const renderer = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
+    release(gl);
+    if (SOFTWARE_RENDERERS.test(renderer)) return true;
+    const fast = document
+      .createElement("canvas")
+      .getContext("webgl2", { failIfMajorPerformanceCaveat: true });
+    if (fast) release(fast);
+    return !fast;
+  } catch {
+    return false;
+  }
 }
