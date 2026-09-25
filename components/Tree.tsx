@@ -20,7 +20,74 @@ import { requestBarkTextures, useCanopy, type BarkTextures } from "@/lib/treeWor
 // right away instead of regrowing it.
 let growIntroPlayed = false;
 
-// Instanced leaf clumps for one canopy batch.
+// The canopy is split into chunks by height band and compass sector, each its
+// own instanced mesh with a tight bounding sphere, so three's frustum culling
+// skips whatever part of a tall crown is off screen (the default view shows
+// its middle; top and bottom run past the frame, and close-ups see a sliver).
+// The canopy is vertex-bound, so every culled sprig is saved work. All chunks
+// share the material and the sprig geometry's buffers.
+const CHUNK_BANDS = 6;
+const CHUNK_SECTORS = 4;
+// Wind sway moves leaves a little past their rest positions.
+const CHUNK_SWAY_MARGIN = 1.5;
+
+type LeafChunk = { geometry: THREE.BufferGeometry; matrices: Float32Array; count: number };
+
+function buildLeafChunks(sprigs: Float64Array, base: THREE.BufferGeometry): LeafChunk[] {
+  const count = sprigs.length / SPRIG_STRIDE;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const y = sprigs[i * SPRIG_STRIDE + 1];
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const span = Math.max(1e-3, maxY - minY);
+  // Sprigs keep their (shuffled) order inside each chunk, so drawing the
+  // first N of every chunk still thins the crown evenly (see density).
+  const lists: number[][] = Array.from({ length: CHUNK_BANDS * CHUNK_SECTORS }, () => []);
+  for (let i = 0; i < count; i++) {
+    const o = i * SPRIG_STRIDE;
+    const band = Math.min(CHUNK_BANDS - 1, Math.floor(((sprigs[o + 1] - minY) / span) * CHUNK_BANDS));
+    const turn = Math.atan2(sprigs[o + 2], sprigs[o]) / (Math.PI * 2) + 1;
+    const sector = Math.floor((turn % 1) * CHUNK_SECTORS) % CHUNK_SECTORS;
+    lists[band * CHUNK_SECTORS + sector].push(i);
+  }
+  base.computeBoundingSphere();
+  const m = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler();
+  const p = new THREE.Vector3();
+  const sc = new THREE.Vector3();
+  return lists
+    .filter((list) => list.length > 0)
+    .map((list) => {
+      const n = list.length;
+      const matrices = new Float32Array(n * 16);
+      // Per-instance shade/hue/phase for the leaf shader.
+      const aLeaf = new Float32Array(n * 3);
+      list.forEach((i, k) => {
+        const o = i * SPRIG_STRIDE;
+        p.set(sprigs[o], sprigs[o + 1], sprigs[o + 2]);
+        e.set(sprigs[o + 3], sprigs[o + 4], sprigs[o + 5]);
+        q.setFromEuler(e);
+        sc.setScalar(sprigs[o + 6]);
+        m.compose(p, q, sc).toArray(matrices, k * 16);
+        aLeaf[k * 3] = sprigs[o + 7];
+        aLeaf[k * 3 + 1] = sprigs[o + 8];
+        aLeaf[k * 3 + 2] = sprigs[o + 9];
+      });
+      // A view of the shared sprig buffers plus this chunk's own aLeaf.
+      const geometry = new THREE.BufferGeometry();
+      geometry.setIndex(base.index);
+      for (const [name, attr] of Object.entries(base.attributes)) geometry.setAttribute(name, attr);
+      geometry.setAttribute("aLeaf", new THREE.InstancedBufferAttribute(aLeaf, 3));
+      geometry.boundingSphere = base.boundingSphere!.clone();
+      return { geometry, matrices, count: n };
+    });
+}
+
+// Instanced leaf clumps for the whole canopy, in culled chunks.
 function LeafClumps({
   sprigs,
   geometry,
@@ -42,62 +109,60 @@ function LeafClumps({
   castShadow?: boolean;
   receiveShadow?: boolean;
 }) {
-  const ref = useRef<THREE.InstancedMesh>(null);
+  const ref = useRef<THREE.Group>(null);
+  const meshes = useRef<(THREE.InstancedMesh | null)[]>([]);
   const firstGrowRun = useRef(true);
-  const count = sprigs.length / SPRIG_STRIDE;
-  // Re-apply matrices after r3f recreates the instanced mesh.
+  const chunks = useMemo(() => buildLeafChunks(sprigs, geometry), [sprigs, geometry]);
+  // Only the chunk's own aLeaf buffer is freed; the shared sprig buffers stay
+  // attributes of the live chunks (three re-uploads anything it dropped).
+  useEffect(
+    () => () => {
+      for (const c of chunks) c.geometry.dispose();
+    },
+    [chunks],
+  );
+
+  // Fill the instance matrices after r3f (re)creates the chunk meshes.
   useLayoutEffect(() => {
-    const mesh = ref.current;
-    if (!mesh) return;
-    const m = new THREE.Matrix4();
-    const q = new THREE.Quaternion();
-    const e = new THREE.Euler();
-    const p = new THREE.Vector3();
-    const s = new THREE.Vector3();
-    // Per-instance shade/hue/phase for the leaf shader.
-    const aLeaf = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
-      const o = i * SPRIG_STRIDE;
-      p.set(sprigs[o], sprigs[o + 1], sprigs[o + 2]);
-      e.set(sprigs[o + 3], sprigs[o + 4], sprigs[o + 5]);
-      q.setFromEuler(e);
-      s.setScalar(sprigs[o + 6]);
-      m.compose(p, q, s);
-      mesh.setMatrixAt(i, m);
-      aLeaf[i * 3] = sprigs[o + 7];
-      aLeaf[i * 3 + 1] = sprigs[o + 8];
-      aLeaf[i * 3 + 2] = sprigs[o + 9];
-    }
-    geometry.setAttribute("aLeaf", new THREE.InstancedBufferAttribute(aLeaf, 3));
-    mesh.instanceMatrix.needsUpdate = true;
-    // Correct culling sphere — the base sprig geometry alone is tiny.
-    mesh.computeBoundingSphere();
-    mesh.visible = grown;
-    mesh.scale.setScalar(grown ? 1 : 0.001);
-  }, [sprigs, count, geometry, grown]);
+    chunks.forEach((c, i) => {
+      const mesh = meshes.current[i];
+      if (!mesh) return;
+      mesh.instanceMatrix.array.set(c.matrices);
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+      if (mesh.boundingSphere) mesh.boundingSphere.radius += CHUNK_SWAY_MARGIN;
+    });
+    const group = ref.current;
+    if (!group) return;
+    group.visible = grown;
+    group.scale.setScalar(grown ? 1 : 0.001);
+  }, [chunks, grown]);
 
   useLayoutEffect(() => {
-    const mesh = ref.current;
-    if (mesh) mesh.count = Math.max(1, Math.round(count * Math.min(1, density)));
-  }, [count, density]);
+    const d = Math.min(1, density);
+    chunks.forEach((c, i) => {
+      const mesh = meshes.current[i];
+      if (mesh) mesh.count = Math.round(c.count * d);
+    });
+  }, [chunks, density]);
 
   // Animate canopy growth.
   useEffect(() => {
-    const mesh = ref.current;
-    if (!mesh) return;
+    const group = ref.current;
+    if (!group) return;
     const skipIntro = firstGrowRun.current && growIntroPlayed;
     firstGrowRun.current = false;
     if (skipIntro) return; // the layout effect already set the final state
-    gsap.killTweensOf(mesh.scale);
+    gsap.killTweensOf(group.scale);
     if (grown) {
-      mesh.visible = true;
+      group.visible = true;
       gsap.fromTo(
-        mesh.scale,
+        group.scale,
         { x: 0.001, y: 0.001, z: 0.001 },
         { x: 1, y: 1, z: 1, duration: 0.75, delay: 0.28, ease: "back.out(1.7)" },
       );
     } else {
-      gsap.to(mesh.scale, {
+      gsap.to(group.scale, {
         x: 0.001,
         y: 0.001,
         z: 0.001,
@@ -111,15 +176,20 @@ function LeafClumps({
   }, [grown]);
 
   return (
-    <instancedMesh
-      ref={ref}
-      args={[geometry, material, count]}
-      customDepthMaterial={depthMaterial}
-      castShadow={castShadow}
-      receiveShadow={receiveShadow}
-      scale={0.001}
-      visible={false}
-    />
+    <group ref={ref} scale={0.001} visible={false}>
+      {chunks.map((c, i) => (
+        <instancedMesh
+          key={i}
+          ref={(mesh) => {
+            meshes.current[i] = mesh;
+          }}
+          args={[c.geometry, material, c.count]}
+          customDepthMaterial={depthMaterial}
+          castShadow={castShadow}
+          receiveShadow={receiveShadow}
+        />
+      ))}
+    </group>
   );
 }
 
@@ -233,7 +303,6 @@ type LeafUniforms = {
   uLeafTint: { value: THREE.Color };
   uWet: { value: number };
   uCloudCover: { value: number };
-  uAerial: { value: number };
 };
 
 // Procedural leaf-card atlas (2×2 tiles): three veined leaf CLUSTERS plus one
@@ -407,7 +476,6 @@ uniform float uSnow;
 uniform vec3 uLeafTint;
 uniform float uWet;
 uniform float uCloudCover;
-uniform float uAerial;
 varying vec3 vLeaf;
 varying vec3 vWPos;
 ` +
@@ -448,16 +516,8 @@ varying vec3 vWPos;
         // Sky rim keeps the crown silhouette readable against the dome.
         float rim = pow(1.0 - clamp(dot(leafV, normalize(vNormal)), 0.0, 1.0), 3.0);
         totalEmissiveRadiance += rim * uSunColor * 0.06 * vLeaf.x;
-        // Aerial perspective: a warm sun-lit haze builds on the DISTANT crown as
-        // a depth cue. Purely additive — it can only add light, never blank the
-        // canopy — and it's gated by uAerial (0 on low/medium).
-        if (uAerial > 0.0) {
-          float aeD = length(vWPos - cameraPosition);
-          float aeHaze = (1.0 - exp(-aeD * 0.013)) * uAerial;
-          vec3 aeView = normalize(vWPos - cameraPosition);
-          float aeSun = max(dot(aeView, normalize(uSunDirW)), 0.0);
-          totalEmissiveRadiance += uSunColor * aeHaze * (0.2 + 0.8 * pow(aeSun, 3.0)) * 0.5;
-        }`,
+        // (Depth haze comes from the scene fog, which fades toward the sky
+        // actually behind the crown: see lib/fog.ts.)`,
         );
   };
   // The shader source depends on receivesShadows, so it must be in the key.
@@ -465,13 +525,21 @@ varying vec3 vWPos;
   return mat;
 }
 
-// Leaf sprig geometry used by each canopy instance: 24 gently folded quad
-// cards (4 tris each), each UV-mapped to one atlas tile so a single card reads as a small leaf cluster.
-// Soft "volume" normals make the crown shade like a rounded mass instead of a
-// pile of flat cards.
+// Leaf sprig geometry used by each canopy instance: 14 flat quad cards
+// (2 tris, 4 vertices each), each UV-mapped to one atlas tile so a single card
+// reads as a small leaf cluster. Soft "volume" normals make the crown shade
+// like a rounded mass instead of a pile of flat cards.
+//
+// The canopy is vertex-bound (tens of thousands of instances, a wind field per
+// vertex), so vertices are what it pays for: this used to be 24 folded cards
+// (144 vertices). The fold never showed in the shading (every card carries one
+// soft normal) and 14 slightly larger cards cover a bit MORE area than the 24
+// did, at 56 vertices: ~2.6x less canopy work, which is most of the frame.
+const SPRIG_CARDS = 14;
+const SPRIG_CARD_SCALE = 1.38;
 function makeLeafSprigGeometry(): THREE.BufferGeometry {
   const geos: THREE.BufferGeometry[] = [];
-  const N = 24;
+  const N = SPRIG_CARDS;
   let seed = 5;
   const rnd = () => {
     seed += 1;
@@ -483,13 +551,10 @@ function makeLeafSprigGeometry(): THREE.BufferGeometry {
   const center = new THREE.Vector3();
   const vtx = new THREE.Vector3();
   for (let i = 0; i < N; i++) {
-    const g = new THREE.PlaneGeometry(0.46, 0.6, 1, 2);
-    g.translate(0, 0.3, 0); // base at the twig anchor, card grows upward
+    const cardH = 0.6 * SPRIG_CARD_SCALE;
+    const g = new THREE.PlaneGeometry(0.46 * SPRIG_CARD_SCALE, cardH, 1, 1);
+    g.translate(0, cardH / 2, 0); // base at the twig anchor, card grows upward
     const pos = g.getAttribute("position") as THREE.BufferAttribute;
-    // Gentle fold: the middle vertex row pops forward.
-    for (let v = 0; v < pos.count; v++) {
-      if (Math.abs(pos.getY(v) - 0.3) < 0.01) pos.setZ(v, 0.06);
-    }
     // Atlas tile: mostly clusters, occasionally the big single leaf. Canvas
     // row 0 is the TOP of the texture (flipY), i.e. v in [0.5, 1].
     const tile = rnd() < 0.12 ? 3 : Math.floor(rnd() * 3);
@@ -631,7 +696,6 @@ export function Tree({
     uLeafTint: { value: new THREE.Color("#ffffff") },
     uWet: { value: 0 },
     uCloudCover: { value: 0 },
-    uAerial: { value: 0 },
   });
 
   // The bark texture and the collision-aware canopy (merged twigs + instanced
@@ -707,8 +771,7 @@ export function Tree({
     // Translucency swells toward the golden hour and dies with the sun.
     u.uSSS.value =
       (0.16 + twilight * 0.85) * THREE.MathUtils.clamp(sunIntensity, 0, 1);
-    u.uAerial.value = quality.aerial;
-  }, [leafColor, snow, twilight, sunColor, sunIntensity, quality.aerial]);
+  }, [leafColor, snow, twilight, sunColor, sunIntensity]);
 
   // Trunk follows the procedural spine and grows with the tower. All static
   // wood (trunk + stubs, roots, ring caps) is merged into ONE geometry per

@@ -5,13 +5,30 @@
 import * as THREE from "three";
 import { GOSSENSASS } from "./location";
 import {
+  celestialPosition,
   moonIllumination,
   moonPosition,
   sceneDirection,
   sunPosition,
   zonedDate,
 } from "./astro";
-import { linearToHex, sampleSky, sunTransmittance, type Atmosphere } from "./skyColor";
+import { observerTransmittance, resolveAtmosphere } from "./atmosphere";
+import {
+  linearToHex,
+  rawTransmittance,
+  sampleSky,
+  sunTransmittance,
+  type Atmosphere,
+} from "./skyColor";
+
+// Display brightness of the sun disc per unit transmitted sunlight, and its
+// cap (HDR: enough to bloom, not enough to flood the frame).
+const SUN_DISC_BRIGHTNESS = 0.55;
+const SUN_DISC_MAX = 14;
+// Direct light on cloud decks per unit transmitted light (display units).
+const DECK_LIGHT = 0.034;
+// Moonlit-sky exposure at full moon.
+const MOON_SKY_EXPOSURE = 0.7;
 
 export { GOSSENSASS };
 
@@ -86,9 +103,14 @@ export type SceneParams = {
   sunPos: [number, number, number];
   sunIntensity: number;
   sunColor: string;
+  sunDisc: [number, number, number]; // HDR linear sun-disc radiance for the dome
+  // The shadow-casting key light: the sun by day, the moon at night.
+  keyLight: { pos: [number, number, number]; color: string; intensity: number };
   ambient: number;
   skyColor: string;
-  fogColor: string;
+  fogColor: string; // horizon 90° from the sun
+  fogSunColor: string; // horizon toward the sun
+  fogAntiColor: string; // horizon away from the sun
   fogNear: number;
   fogFar: number;
   wind: number; // sway multiplier
@@ -102,12 +124,21 @@ export type SceneParams = {
   dayFactor: number; // 0 night .. 1 noon
   sunElevationDeg: number; // real solar elevation, negative below horizon
   twilight: number; // 0..1, peaks while the sun crosses the horizon
-  atmosphere: Atmosphere; // physical sky model inputs (see lib/skyColor.ts)
+  atmosphere: Atmosphere; // physical sky model inputs (see lib/atmosphere.ts)
   season: Season;
   leafColor: string; // seasonal foliage tint
   snow: number; // 0..1 accumulation on surfaces
   cloud: number; // 0..1 total cover
   clouds: CloudSceneParams;
+  cirrus: {
+    light: [number, number, number]; // direct sun/moon light on the cirrus deck
+    ambient: [number, number, number]; // sky light on the cirrus deck
+  };
+  galaxy: {
+    pole: [number, number, number]; // north galactic pole, scene space
+    center: [number, number, number]; // galactic center, scene space
+    visible: number; // 0..1
+  };
   starsIntensity: number; // 0..1, suppressed by daylight/clouds/fog/precip
   moon: {
     pos: [number, number, number];
@@ -305,8 +336,10 @@ export function sceneFromWeather(w: Weather): SceneParams {
   const rainMood = rainy ? clamp(0.42 + precipIntensity * 0.45 + (w.sky === "storm" ? 0.18 : 0), 0, 0.95) : 0;
   const cloudShadow = clamp(totalCloud * 0.58 + lowCloud * 0.22 + fog * 0.35 + rainMood * 0.28, 0, 0.98);
   // Cinematic golden hour: the low sun rakes the scene a touch harder.
+  // Fades to exactly zero at the end of civil twilight (day = 0), where the
+  // moon takes over as key light.
   const sunIntensity =
-    lerp(0.12, 2.05, day) *
+    (2.05 * day + 0.12 * Math.min(1, day * 10)) *
     (1 + twilight * 0.45) *
     lerp(1, 0.36, cloudShadow) *
     lerp(1, 0.68, rainMood);
@@ -319,64 +352,111 @@ export function sceneFromWeather(w: Weather): SceneParams {
   );
   const moon = moonFromDate(date, day, cloudShadow, fog, rainMood);
 
-  // Physical atmosphere: the weather drives haze/aerosols the way it does in
-  // real life (humid = milkier, overcast = flat gray, storm = slate).
+  // Physical atmosphere (lib/atmosphere.ts): the weather drives the aerosols
+  // the way it does in real life (humid = milkier, overcast = flat gray,
+  // storm = slate). Exposure and the dusk sky light are resolved from the
+  // sun's position so the dome, fog and lights share one brightness curve.
   const humidity01 = clamp(humidity / 100, 0, 1);
+  const sunDirUnit = new THREE.Vector3(pos[0], pos[1], pos[2]).normalize();
+  const moonDirUnit = new THREE.Vector3(moon.pos[0], moon.pos[1], moon.pos[2]).normalize();
+  const resolved = resolveAtmosphere([sunDirUnit.x, sunDirUnit.y, sunDirUnit.z], {
+    // Cold, dry air scatters a touch deeper blue.
+    rayleigh: finite(w.tempC, 12) < 2 ? 1.06 : 1,
+    haze: clamp(0.9 + humidity01 * 1.1 + totalCloud * 1.4 + fog * 7 + rainMood * 3, 0.9, 12),
+    mieG: 0.8,
+    moonExposure: 0,
+  });
+  const overcast = clamp(cloudShadow * 0.85, 0, 0.92);
+  // Moonlit sky: the same scattering lit by the moon. Real moonlight is ~1/400k
+  // of sunlight; this is scaled so a full moon gives a faint silver-blue night.
+  // Phase counts super-linearly (a half moon is ~1/10 of full in reality).
+  const moonSky =
+    moonDirUnit.y > -0.1
+      ? MOON_SKY_EXPOSURE *
+        Math.pow(moon.illumination, 1.5) *
+        (1 - THREE.MathUtils.smoothstep(day, 0.04, 0.3))
+      : 0;
   const atmosphere: Atmosphere = {
-    turbidity: clamp(1.6 + humidity01 * 1.6 + totalCloud * 5 + fog * 6 + rainMood * 3, 1.4, 14),
-    rayleigh: 3.0 + (finite(w.tempC, 12) < 2 ? 0.35 : 0),
-    mieCoefficient: clamp(
-      0.003 + humidity01 * 0.003 + totalCloud * 0.008 + rainMood * 0.012 + fog * 0.014,
-      0.002,
-      0.04,
-    ),
-    mieDirectionalG: 0.8,
-    // Calibrated so ACES(x · toneMappingExposure/0.6) matches the reference
-    // three.js Sky look (renderer exposure 0.5): 0.45 · (1.12/0.6) ≈ 0.83.
-    exposure: 0.19,
-    overcast: clamp(cloudShadow * 0.85, 0, 0.92),
+    ...resolved,
+    moonExposure: moonSky,
+    overcast,
     moodMix: rainMood * 0.75,
     moodColor: w.sky === "storm" ? [0.16, 0.19, 0.26] : [0.35, 0.42, 0.48],
-    // Tuned so a clear full-moon night reads as a faint silver-blue glow
-    // (real moonlight is ~1/400k of sunlight; this is gently exaggerated).
-    moonE: moon.visible * (0.25 + moon.illumination * 0.75) * clamp(1 - day * 2, 0, 1) * 4.5,
+    nightGlow: 1 - overcast * 0.75,
   };
 
   // Fog/background/light colors are SAMPLED FROM THE SAME ATMOSPHERE the dome
-  // shader renders, so everything always matches the visible sky.
-  const sunDirUnit = new THREE.Vector3(pos[0], pos[1], pos[2]).normalize();
-  const moonDirUnit = new THREE.Vector3(moon.pos[0], moon.pos[1], moon.pos[2]).normalize();
-  const horizonDir = new THREE.Vector3(-sunDirUnit.z, 0.05, sunDirUnit.x).normalize();
-  const skyDir = new THREE.Vector3(sunDirUnit.x * 0.22, 0.72, sunDirUnit.z * 0.22).normalize();
-  const fogColRaw = sampleSky(horizonDir, sunDirUnit, moonDirUnit, atmosphere);
+  // renders, so everything always matches the visible sky.
+  const sunFlat = Math.hypot(sunDirUnit.x, sunDirUnit.z) > 1e-3
+    ? new THREE.Vector3(sunDirUnit.x, 0, sunDirUnit.z).normalize()
+    : new THREE.Vector3(1, 0, 0);
+  const horizonAt = (x: number, z: number) => new THREE.Vector3(x, 0.05, z).normalize();
+  const fogCol = sampleSky(horizonAt(-sunFlat.z, sunFlat.x), sunDirUnit, moonDirUnit, atmosphere);
+  const fogSunCol = sampleSky(horizonAt(sunFlat.x, sunFlat.z), sunDirUnit, moonDirUnit, atmosphere);
+  const fogAntiCol = sampleSky(horizonAt(-sunFlat.x, -sunFlat.z), sunDirUnit, moonDirUnit, atmosphere);
+  const skyDir = new THREE.Vector3(sunFlat.x * 0.22, 0.72, sunFlat.z * 0.22).normalize();
   const skyCol = sampleSky(skyDir, sunDirUnit, moonDirUnit, atmosphere);
-  // Golden-hour haze: the low-sun air GLOWS — warm the horizon fog toward the
-  // sun color while the sun crosses the horizon (the "air is lit" look).
-  const fogCol = fogColRaw
-    .clone()
-    .lerp(sunTransmittance(sunDirUnit, atmosphere), twilight * 0.3);
+  const zenithCol = sampleSky(new THREE.Vector3(0, 1, 0), sunDirUnit, moonDirUnit, atmosphere);
   // Direct sunlight color = atmospheric transmittance (white at noon, amber at
   // the horizon), pulled toward neutral gray under heavy cloud.
-  const sunColor = linearToHex(
-    sunTransmittance(sunDirUnit, atmosphere).lerp(
-      new THREE.Color("#d4d8dc"),
-      clamp(cloudShadow * 0.7, 0, 0.8),
-    ),
+  const sunColorLinear = sunTransmittance(sunDirUnit, atmosphere).lerp(
+    new THREE.Color("#d4d8dc"),
+    clamp(cloudShadow * 0.7, 0, 0.8),
   );
+  const sunColor = linearToHex(sunColorLinear);
+
+  // Sun disc radiance for the dome (HDR, so it blooms): what really reaches
+  // the eye through the air, hidden by overcast, fog and rain.
+  const sunVeil = (1 - overcast * 0.97) * (1 - fog * 0.9) * (1 - rainMood);
+  const sunDisc = rawTransmittance(sunDirUnit, atmosphere).multiplyScalar(
+    resolved.exposure * SUN_DISC_BRIGHTNESS * sunVeil,
+  );
+  const discLum = sunDisc.r * 0.2126 + sunDisc.g * 0.7152 + sunDisc.b * 0.0722;
+  if (discLum > SUN_DISC_MAX) sunDisc.multiplyScalar(SUN_DISC_MAX / discLum);
+
+  // Light reaching a cloud deck (~3 km for the cumulus, ~9 km for cirrus):
+  // clouds stay sunlit a little after sunset and glow pink/orange then.
+  const deckLight = (height: number) => {
+    const t = observerTransmittance([sunDirUnit.x, sunDirUnit.y, sunDirUnit.z], atmosphere, height);
+    const e = resolved.exposure * DECK_LIGHT;
+    const m = observerTransmittance([moonDirUnit.x, moonDirUnit.y, moonDirUnit.z], atmosphere, height);
+    const me = moonSky * DECK_LIGHT;
+    return new THREE.Color(t[0] * e + m[0] * me, t[1] * e + m[1] * me, t[2] * e + m[2] * me);
+  };
+  const cirrusLight = deckLight(9000);
+  const cloudLight = deckLight(3000).multiplyScalar(lerp(1, 0.55, cloudShadow));
+
+  // Key light: the sun by day, the moon by night (with its own shadows).
+  // They swap once the sun is ~5° down, where both are equally dim.
+  const moonKey =
+    moon.visible * (0.25 + moon.illumination * 0.75) * 0.34 *
+    (1 - THREE.MathUtils.smoothstep(day, 0, 0.06));
+  const moonT = observerTransmittance(
+    [moonDirUnit.x, Math.max(moonDirUnit.y, 0.02), moonDirUnit.z],
+    atmosphere,
+  );
+  const moonTMax = Math.max(moonT[0], moonT[1], moonT[2], 1e-6);
+  const moonColor = new THREE.Color(0.62, 0.72, 0.98).multiply(
+    new THREE.Color(moonT[0] / moonTMax, moonT[1] / moonTMax, moonT[2] / moonTMax),
+  );
+  const moonKeyWins = moonKey > sunIntensity;
+  const keyLight = moonKeyWins
+    ? {
+        pos: [moon.pos[0], moon.pos[1], moon.pos[2]] as [number, number, number],
+        color: linearToHex(moonColor),
+        intensity: moonKey,
+      }
+    : { pos, color: sunColor, intensity: sunIntensity };
 
   // Twilight pulls the haze in a touch so the glow reads as depth.
   const fogNear = lerp(55, 13, fog) * (1 - twilight * 0.12);
   const fogFar = lerp(135, 42, fog);
-  // Clouds catch the low sun: golden/pink undersides at dawn and dusk, and
-  // they dim toward night instead of staying paper-white.
-  const cloudBase = new THREE.Color("#f2f0e9")
-    .lerp(new THREE.Color("#c8ced1"), cloudShadow * 0.62)
-    .lerp(new THREE.Color(sunColor), twilight * 0.55)
-    .multiplyScalar(lerp(0.32, 1, clamp(day * 2.4 + twilight * 0.4, 0, 1)));
-  const cloudShade = new THREE.Color("#8d969e")
-    .lerp(new THREE.Color("#46505a"), clamp(totalCloud * 0.7 + fog * 0.35, 0, 1))
-    .lerp(new THREE.Color(sunColor), twilight * 0.22)
-    .multiplyScalar(lerp(0.35, 1, clamp(day * 2.4 + twilight * 0.3, 0, 1)));
+  // Volumetric cloud colors from the same light: lit tops take the deck light
+  // plus sky light, shaded bases only the sky light (dark at night, pink at
+  // dusk, silver under a full moon).
+  const skyLight = zenithCol.clone().multiplyScalar(1.15);
+  const cloudShade = skyLight.clone().lerp(fogCol, 0.35).multiplyScalar(lerp(0.9, 0.6, cloudShadow));
+  const cloudBase = cloudShade.clone().add(cloudLight);
   // Foliage warms in the golden hour (sunlit leaves read amber in real life).
   const leafColor =
     "#" +
@@ -384,15 +464,28 @@ export function sceneFromWeather(w: Weather): SceneParams {
       .lerp(new THREE.Color("#d8a24a"), twilight * 0.28)
       .getHexString();
 
+  // Milky Way: the real galactic plane over the location at this moment,
+  // washed out by moonlight, clouds and anything but a dark night.
+  const galaxyDir = (raDeg: number, decDeg: number) => {
+    const p = celestialPosition(date, GOSSENSASS.lat, GOSSENSASS.lon, raDeg * THREE.MathUtils.DEG2RAD, decDeg * THREE.MathUtils.DEG2RAD);
+    return sceneDirection(p.azimuth, p.altitude);
+  };
+  const moonGlare = clamp(moonDirUnit.y * 6, 0, 1) * moon.illumination;
+  const galaxyVisible = starsIntensity * (1 - moonGlare * 0.85);
+
   return {
     sunPos: pos,
     sunIntensity,
     sunColor,
+    sunDisc: [sunDisc.r, sunDisc.g, sunDisc.b],
+    keyLight,
     // The physical sky color is bright, so the hemisphere intensity is kept
     // low to hold a sensible light energy.
     ambient: (lerp(0.12, 0.36, day) + totalCloud * 0.05) * lerp(1, 0.72, rainMood),
     skyColor: linearToHex(skyCol),
     fogColor: linearToHex(fogCol),
+    fogSunColor: linearToHex(fogSunCol),
+    fogAntiColor: linearToHex(fogAntiCol),
     fogNear,
     fogFar,
     wind,
@@ -417,8 +510,17 @@ export function sceneFromWeather(w: Weather): SceneParams {
       high: cloudLayer(highCloud, 52, 11, 0.032, windKmh * 1.25, 1.35),
       fog,
       visibilityM,
-      baseColor: "#" + cloudBase.getHexString(),
-      shadowColor: "#" + cloudShade.getHexString(),
+      baseColor: linearToHex(cloudBase),
+      shadowColor: linearToHex(cloudShade),
+    },
+    cirrus: {
+      light: [cirrusLight.r, cirrusLight.g, cirrusLight.b],
+      ambient: [zenithCol.r * 0.9, zenithCol.g * 0.9, zenithCol.b * 0.9],
+    },
+    galaxy: {
+      pole: galaxyDir(192.8595, 27.1283),
+      center: galaxyDir(266.405, -28.936),
+      visible: galaxyVisible,
     },
     starsIntensity,
     moon,

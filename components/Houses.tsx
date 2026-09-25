@@ -453,7 +453,7 @@ function ExtraDeckLanterns({
         yaw: -angle + Math.PI * 0.5,
         x: anchor.pos.x + Math.cos(angle) * radius,
         z: anchor.pos.z + Math.sin(angle) * radius,
-        lantern: buildLantern(lanternScene, LANTERN_SIZE * 0.92, LANTERN_ROT, 1),
+        lantern: buildLantern(lanternScene, LANTERN_SIZE * 0.92, LANTERN_ROT, 1, "deck"),
       });
     }
     return out;

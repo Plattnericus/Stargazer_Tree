@@ -149,7 +149,9 @@ export function Ants({
       model.position.set(-center.x, -box.min.y, -center.z);
       model.traverse((obj) => {
         if (!(obj instanceof THREE.Mesh)) return;
-        obj.castShadow = true;
+        // Villager shadows are a few pixels wide but cost a skinned draw
+        // per ant in every shadow pass, so only the top tiers keep them.
+        obj.castShadow = profile.antShadows;
         obj.receiveShadow = true;
         if (!Array.isArray(obj.material)) obj.material = tweak(obj.material);
       });
@@ -167,7 +169,7 @@ export function Ants({
 
       return root;
     });
-  }, [antScene, animations, ants]);
+  }, [antScene, animations, ants, profile.antShadows]);
 
   useFrame((state, dt) => {
     const d = Math.min(dt, 0.05);

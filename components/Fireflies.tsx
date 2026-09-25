@@ -106,6 +106,8 @@ export function Fireflies({
             vec3 col = mix(uColorA, uColorB, vTint);
             float alpha = glow * vPulse * uIntensity;
             gl_FragColor = vec4(col * (0.6 + glow), alpha);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
           }
         `,
       }),

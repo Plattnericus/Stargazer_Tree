@@ -20,14 +20,13 @@ import {
 } from "@react-three/drei";
 import {
   Bloom,
-  BrightnessContrast,
   EffectComposer,
-  HueSaturation,
   N8AO,
   SMAA,
   ToneMapping,
   Vignette,
 } from "@react-three/postprocessing";
+import { applyGrade, GradeEffectImpl } from "./GradeEffect";
 import { ToneMappingMode } from "postprocessing";
 import * as THREE from "three";
 import "@/lib/shaderPatches";
@@ -105,8 +104,11 @@ function useDprRange(quality: QualityProfile) {
   const native = quality.nativeDpr ? Math.min(screen.ratio, 2) : 0;
   const budget = screen.pixels > 0 ? Math.sqrt(MAX_FRAME_PIXELS / screen.pixels) : Infinity;
   const max = Math.max(quality.minDpr, Math.min(Math.max(quality.maxDpr, native), budget));
-  const idle = Math.min(Math.max(quality.idleDpr, native), max);
-  return { min: quality.minDpr, idle, max };
+  // Big windows start inside the tier's pixel budget (a 2560x1440 monitor at
+  // 1.2x would be 5.3 MP of fill); the adaptive loop can climb back to `max`.
+  const fit = screen.pixels > 0 ? Math.sqrt(quality.idlePixels / screen.pixels) : Infinity;
+  const idle = Math.min(Math.max(quality.idleDpr, native), max, Math.max(fit, 0.6));
+  return { min: Math.min(quality.minDpr, idle), idle, max };
 }
 
 // Models every quality tier needs, loaded together behind one Suspense
@@ -152,9 +154,9 @@ const CLOUD_FRAGMENT = /* glsl */ `
   uniform float uRange;
   uniform float uFog;
   uniform vec2 uWindDir;
-  uniform vec3 uBaseColor;
-  uniform vec3 uShadowColor;
-  uniform vec3 uSunDir;
+  uniform vec3 uBaseColor; // sky light + direct sun/moon light on a cloud top
+  uniform vec3 uShadowColor; // sky light only (a shaded base)
+  uniform vec3 uSunDir; // toward the key light (sun by day, moon by night)
   varying vec3 vWorldPos;
 
   float hash(vec3 p) {
@@ -176,19 +178,23 @@ const CLOUD_FRAGMENT = /* glsl */ `
     );
   }
 
-  // Upper bound of fbm(): noise() < 1 and the octave weights
-  // 0.55 * 0.48^k (k = 0..4) sum to 1.0307.
-  const float FBM_MAX = 1.031;
-
-  float fbm(vec3 p) {
+  // Cloud shape: 4 octaves (weights 0.55 * 0.48^k sum to 1.0016, and
+  // noise() < 1); the 5th octave of the old shader was below a pixel at these
+  // distances. FBM_MAX bounds both fbm4 and the rescaled fbm2 below.
+  const float FBM_MAX = 1.002;
+  float fbm4(vec3 p) {
     float v = 0.0;
     float a = 0.55;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 4; i++) {
       v += noise(p) * a;
       p = p * 2.07 + vec3(13.1, 7.7, 4.9);
       a *= 0.48;
     }
     return v;
+  }
+  // Two octaves (max 0.814), for the erosion detail and the light probe.
+  float fbm2(vec3 p) {
+    return noise(p) * 0.55 + noise(p * 2.07 + vec3(13.1, 7.7, 4.9)) * 0.264;
   }
 
   vec2 boxHit(vec3 ro, vec3 rd, vec3 mn, vec3 mx) {
@@ -200,12 +206,19 @@ const CLOUD_FRAGMENT = /* glsl */ `
     return vec2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
   }
 
+  // Henyey-Greenstein, normalized so isotropic scattering is 1.
+  float hg(float mu, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * mu, 1.5);
+  }
+
   void main() {
     if (uCoverage < 0.015 || uDensity < 0.01 || uOpacity < 0.01) discard;
     vec3 ro = cameraPosition;
     vec3 rd = normalize(vWorldPos - ro);
-    vec3 mn = vec3(-uRange, uHeight - uThickness * 0.5, -uRange);
-    vec3 mx = vec3(uRange, uHeight + uThickness * 0.5, uRange);
+    float halfT = uThickness * 0.5;
+    vec3 mn = vec3(-uRange, uHeight - halfT, -uRange);
+    vec3 mx = vec3(uRange, uHeight + halfT, uRange);
     vec2 hit = boxHit(ro, rd, mn, mx);
     if (hit.x > hit.y || hit.y < 0.0) discard;
 
@@ -216,17 +229,24 @@ const CLOUD_FRAGMENT = /* glsl */ `
 
     float steps = clamp(uSteps, 6.0, 30.0);
     float stride = rayLen / steps;
-    // per-pixel jitter on the march offset removes visible step banding
-    float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    // Interleaved gradient noise on the march offset: spreads the step
+    // banding into a finer, more even pattern than a sine hash.
+    float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
     vec2 wind = normalize(uWindDir);
+    vec3 lightDir = normalize(uSunDir);
     vec3 color = vec3(0.0);
     float alpha = 0.0;
     float threshold = mix(0.86, 0.32, clamp(uCoverage, 0.0, 1.0));
     // Loop-invariant terms, computed once per pixel instead of per step.
     vec2 drift = wind * uTime * uSpeed;
-    float light = clamp(dot(normalize(vec3(wind.x * 0.2, 0.6, wind.y * 0.2) + uSunDir * 0.45), uSunDir) * 0.5 + 0.5, 0.0, 1.0);
-    float shade = 0.42 + light * 0.42;
     float detailScale = 2.0 + uDetail;
+    // Dual-lobe phase: a bright silver lining toward the sun/moon plus a soft
+    // back-scatter glow, like real cumulus.
+    float mu = dot(rd, lightDir);
+    float phase = mix(hg(mu, 0.5), hg(mu, -0.2), 0.35) * 0.8;
+    // Probe offset toward the light, in noise space (see q below).
+    vec3 lightStep = vec3(lightDir.x * uScale, lightDir.y * uScale * 0.42, lightDir.z * uScale) * 3.2;
+    vec3 directCol = uBaseColor - uShadowColor;
 
     // Samples that can't contribute are skipped before the expensive noise.
     // Every skip is exact: such a sample has edge == 0, so a == 0 and it
@@ -235,46 +255,57 @@ const CLOUD_FRAGMENT = /* glsl */ `
       if (float(i) >= steps || alpha > 0.965) break;
       float fi = (float(i) + jitter) / steps;
       vec3 p = ro + rd * (start + fi * rayLen);
-      float vertical = 1.0 - abs(p.y - uHeight) / max(0.001, uThickness * 0.5);
-      vertical = smoothstep(0.0, 0.72, vertical);
+      // Height in the layer: flat-ish bases, rounded tops (cumulus profile).
+      float hf = clamp((p.y - (uHeight - halfT)) / uThickness, 0.0, 1.0);
+      float vertical = smoothstep(0.0, 0.18, hf) * (1.0 - smoothstep(0.5, 1.0, hf));
       if (vertical <= 0.0) continue;
       vec3 q = vec3((p.xz + drift).x * uScale, p.y * uScale * 0.42, (p.xz + drift).y * uScale);
-      float large = fbm(q * 0.68);
-      // n = mix(large, detail, 0.33) with detail <= FBM_MAX: if even the
-      // largest detail can't lift n over the threshold, skip the second fbm.
+      float large = fbm4(q * 0.68);
+      // n = mix(large, detail, 0.33) with detail <= 0.814 * 1.23 < FBM_MAX:
+      // if even the largest detail can't lift n over the threshold, skip
+      // the rest (exact, like the other skips).
       if (mix(large, FBM_MAX, 0.33) <= threshold) continue;
-      float detail = fbm(q * detailScale);
+      float detail = fbm2(q * detailScale) * 1.23;
       float n = mix(large, detail, 0.33);
       float edge = smoothstep(threshold, threshold + 0.23, n) * vertical;
       if (edge <= 0.0) continue;
       float d = edge * uDensity;
+      // Self-shadow: how much cloud sits a few units toward the light
+      // (Beer's law), plus the powder term that darkens the thin sunlit
+      // edges of dense clouds the way real ones do.
+      float occ = smoothstep(threshold - 0.05, threshold + 0.28, fbm2((q + lightStep) * 0.68) * 1.23);
+      float beer = exp(-occ * uDensity * 2.4);
+      float powder = 1.0 - exp(-d * 3.0);
+      float direct = beer * mix(1.0, powder, 0.55) * phase * mix(0.55, 1.0, hf);
+      vec3 sampleColor = uShadowColor * mix(0.6, 1.05, hf) + directCol * direct;
       float a = 1.0 - exp(-d * stride * 0.075);
       a *= (1.0 - alpha);
-      vec3 sampleColor = mix(uShadowColor, uBaseColor, shade + vertical * 0.16);
       color += sampleColor * a;
       alpha += a;
     }
 
-    // silver lining: strong forward scattering brightens cloud edges that
-    // sit between the camera and the sun (golden rims at a low sun)
-    float silver = pow(max(dot(rd, uSunDir), 0.0), 6.0);
-    color *= 1.0 + silver * 0.5;
-
-    alpha *= uOpacity;
-    alpha *= 1.0 - clamp(uFog * 0.18, 0.0, 0.18);
+    // color is premultiplied by the march's own alpha: un-premultiply with
+    // THAT alpha before the layer opacity scales it (dividing by the scaled
+    // alpha, as before, brightened thin layers by 1/opacity).
+    vec3 cloudCol = color / max(alpha, 0.001);
+    alpha *= uOpacity * (1.0 - clamp(uFog * 0.18, 0.0, 0.18));
     if (alpha < 0.012) discard;
-    gl_FragColor = vec4(color / max(alpha, 0.001), alpha);
+    gl_FragColor = vec4(cloudCol, alpha);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
   }
 `;
 
 function CloudVolumeLayer({
   layer,
+  height,
   params,
   quality,
   order,
   visible = true,
 }: {
   layer: CloudLayerParams;
+  height: number;
   params: SceneParams;
   quality: number;
   order: number;
@@ -288,7 +319,7 @@ function CloudVolumeLayer({
       uTime: { value: 0 },
       uCoverage: { value: layer.coverage },
       uDensity: { value: layer.density },
-      uHeight: { value: layer.height },
+      uHeight: { value: height },
       uThickness: { value: layer.thickness },
       uScale: { value: layer.scale },
       uOpacity: { value: layer.opacity },
@@ -310,6 +341,7 @@ function CloudVolumeLayer({
     if (!m) return;
     const k = Math.min(1, dt * 0.9);
     m.uniforms.uTime.value = state.clock.elapsedTime;
+    m.uniforms.uHeight.value = height;
     m.uniforms.uCoverage.value += (layer.coverage - m.uniforms.uCoverage.value) * k;
     m.uniforms.uDensity.value += (layer.density - m.uniforms.uDensity.value) * k;
     m.uniforms.uOpacity.value += (layer.opacity - m.uniforms.uOpacity.value) * k;
@@ -321,7 +353,8 @@ function CloudVolumeLayer({
     (m.uniforms.uWindDir.value as THREE.Vector2).set(params.windVec[0], params.windVec[1]).normalize();
     (m.uniforms.uBaseColor.value as THREE.Color).set(params.clouds.baseColor);
     (m.uniforms.uShadowColor.value as THREE.Color).set(params.clouds.shadowColor);
-    (m.uniforms.uSunDir.value as THREE.Vector3).set(...params.sunPos).normalize();
+    // Lit by the key light: the sun by day, the moon at night.
+    (m.uniforms.uSunDir.value as THREE.Vector3).set(...params.keyLight.pos).normalize();
     // The fragment shader discards every pixel below these limits; skipping
     // the draw avoids a full-screen raymarch that produces nothing.
     if (mesh.current) {
@@ -336,7 +369,7 @@ function CloudVolumeLayer({
   return (
     <mesh
       ref={mesh}
-      position={[0, layer.height, 0]}
+      position={[0, height, 0]}
       renderOrder={order}
       frustumCulled={false}
       visible={visible}
@@ -356,35 +389,47 @@ function CloudVolumeLayer({
   );
 }
 
+// The low deck floats as a sea of cloud below the island (whose rock ends at
+// y ≈ -7.6); the mid and high decks ride above the crown, however tall the
+// tree has grown. Fixed heights used to slice straight through a big tree and
+// wrap the orbit camera in cloud.
+const CLOUD_SEA_Y = -22;
+
 function VolumetricClouds({
   params,
   quality,
   moving,
+  treeTop,
 }: {
   params: SceneParams;
   quality: number;
   moving: boolean;
+  treeTop: number;
 }) {
   const profile = useQualityProfile();
   // The tree stays the same while the camera moves; the extra layers are only
   // hidden, so starting/stopping a drag never remounts a cloud material.
   const extraLayers = !moving && profile.cloudLayers > 1;
+  const midY = Math.max(params.clouds.mid.height, treeTop + 14);
+  const highY = Math.max(params.clouds.high.height, midY + 22);
 
   return (
     <group>
       {profile.cloudLayers === 3 && (
         <CloudVolumeLayer
           layer={params.clouds.high}
+          height={highY}
           params={params}
           quality={quality * 0.84}
           order={-3}
           visible={extraLayers}
         />
       )}
-      <CloudVolumeLayer layer={params.clouds.mid} params={params} quality={quality} order={-2} />
+      <CloudVolumeLayer layer={params.clouds.mid} height={midY} params={params} quality={quality} order={-2} />
       {profile.cloudLayers > 1 && (
         <CloudVolumeLayer
           layer={params.clouds.low}
+          height={CLOUD_SEA_Y}
           params={params}
           quality={quality * 0.92}
           order={-1}
@@ -653,6 +698,21 @@ function FrameStatsProbe() {
   return null;
 }
 
+// Dev-only handle for the headless visual tests (like window.__sceneParams in
+// app/page.tsx): lets a test script place the camera deterministically.
+function DevHandle() {
+  const gl = useThree((s) => s.gl);
+  const scene = useThree((s) => s.scene);
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls);
+  const setDpr = useThree((s) => s.setDpr);
+  useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    (window as unknown as { __three?: unknown }).__three = { gl, scene, camera, controls, setDpr };
+  }, [gl, scene, camera, controls, setDpr]);
+  return null;
+}
+
 // Fills the island plateau using the sampled island surface.
 function Plateau({
   wind,
@@ -751,11 +811,17 @@ export default function Experience({
   const quality = QUALITY_PROFILES[graphicsQuality];
   // Night factor drives warm lights and fireflies.
   const night = Math.min(1, Math.max(0, 1 - params.dayFactor * 1.5));
-  // Sun disc position, far out along the real sun direction.
-  const sunFar = useMemo<[number, number, number]>(() => {
-    const p = new THREE.Vector3(...params.sunPos).normalize().multiplyScalar(120);
-    return [p.x, p.y, p.z];
-  }, [params.sunPos]);
+  // Fill-light colors, eased from warm day tones to cool moonlit ones. (The
+  // sun disc itself is drawn by the sky dome, see components/Sky.tsx.)
+  const nightStep = Math.round(night * 20) / 20;
+  const [fillSky, fillGround, fillKey] = useMemo(
+    () => [
+      new THREE.Color("#f8dfb8").lerp(new THREE.Color("#8c9fcc"), nightStep),
+      new THREE.Color("#3f3326").lerp(new THREE.Color("#1c2230"), nightStep),
+      new THREE.Color("#ffd29a").lerp(new THREE.Color("#7f97cf"), nightStep),
+    ],
+    [nightStep],
+  );
   // Quality presets keep motion responsive without dropping the scene into a visibly pixelated state.
   const dprRange = useDprRange(quality);
   const [dprState, setDpr] = useState(dprRange.idle);
@@ -879,6 +945,19 @@ export default function Experience({
   // camera drag. Twilight is snapped to 5% steps so a sunset rebuilds the
   // chain a handful of times instead of on every clock tick.
   const twilight = Math.round(params.twilight * 20) / 20;
+  // Color grade: one stable effect instance, its uniforms follow the light.
+  // Golden hour warms the highlights, night cools the shadows (moonlight).
+  const grade = useMemo(() => new GradeEffectImpl(), []);
+  useEffect(() => () => grade.dispose(), [grade]);
+  useEffect(() => {
+    applyGrade(grade, {
+      contrast: quality.grade ? 0.22 : 0.12,
+      saturation: 0.1 + twilight * 0.1 - nightStep * 0.12,
+      vibrance: 0.18,
+      shadowTint: [-0.006 * nightStep, 0.002 * nightStep, 0.02 * nightStep],
+      highlightTint: [1 + twilight * 0.04, 1 + twilight * 0.01, 1 - twilight * 0.05],
+    });
+  }, [grade, quality.grade, twilight, nightStep]);
   const postEffects = useMemo(() => {
     const effects: ReactElement[] = [];
     if (!postEnabled) return effects;
@@ -894,15 +973,14 @@ export default function Experience({
           luminanceSmoothing={0.3}
         />,
       );
-    if (quality.grade)
-      effects.push(<BrightnessContrast key="grade" brightness={0} contrast={0.09} />);
-    effects.push(<HueSaturation key="hue" saturation={0.18 + twilight * 0.12} />);
+    // Tone mapping first, then the grade in display space (see GradeEffect).
     effects.push(<ToneMapping key="tone" mode={ToneMappingMode.ACES_FILMIC} />);
+    effects.push(<primitive key="grade" object={grade} dispose={null} />);
     if (quality.vignette)
       effects.push(<Vignette key="vig" eskil={false} offset={0.3} darkness={0.6} />);
     if (quality.smaa) effects.push(<SMAA key="smaa" />);
     return effects;
-  }, [postEnabled, quality, twilight]);
+  }, [postEnabled, quality, twilight, grade]);
 
   // Houses and bridges get trimesh colliders once walk mode has loaded physics.
   const withColliders = (node: ReactElement) =>
@@ -964,30 +1042,25 @@ export default function Experience({
         <Sky params={params} />
         <NightSky params={params} />
 
-        {/* Soft fill lights keep the island readable. */}
+        {/* Soft fill lights keep the island readable: warm by day, a cool
+            moonlit blue at night (the lanterns bring the warmth then). */}
         <hemisphereLight
-          intensity={0.36 + night * 0.42}
-          color="#f8dfb8"
-          groundColor="#3f3326"
+          intensity={0.36 + night * 0.1}
+          color={fillSky}
+          groundColor={fillGround}
         />
         <directionalLight
           position={[-14, 12, -10]}
-          intensity={0.2 + night * 0.28}
-          color="#ffd29a"
+          intensity={0.2 + night * 0.06}
+          color={fillKey}
         />
-
-        {/* Depth-tested sun disc: the canopy occludes it, so bloom only glows
-            where the sun is actually visible. */}
-        <mesh position={sunFar} visible={params.sunElevationDeg > -0.8}>
-          <sphereGeometry args={[4.4, 20, 20]} />
-          <meshBasicMaterial color={params.sunColor} toneMapped={false} depthWrite={false} />
-        </mesh>
 
         {/* Weather-driven volumetric clouds. */}
         <VolumetricClouds
           params={params}
           quality={effectiveCloudQuality}
           moving={performanceMoving}
+          treeTop={TREE_Y + worldH}
         />
         <Dove interactive={!flying} onFind={onFindDove} moving={performanceMoving} />
 
@@ -1071,6 +1144,11 @@ export default function Experience({
           storm={params.storm}
           budget={perfBudget}
           moving={performanceMoving}
+          treeTop={TREE_Y + worldH}
+          lightDir={params.keyLight.pos}
+          cloudLight={params.clouds.baseColor}
+          skyTop={params.clouds.shadowColor}
+          skyBottom={params.fogColor}
         />
         <Preload all />
 
@@ -1093,6 +1171,7 @@ export default function Experience({
           Settings); the rotate/tilt part of this driver safely no-ops
           without OrbitControls (state.controls is null in fly/walk). */}
       <CameraRotateDriver />
+      {process.env.NODE_ENV !== "production" && <DevHandle />}
       {!flying && (
         <CameraFocusRig
           defaultTarget={orbitTarget}

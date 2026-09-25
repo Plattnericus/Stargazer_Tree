@@ -41,6 +41,8 @@ const STAR_FRAGMENT = /* glsl */ `
     float lowFlicker = 1.0 + (1.0 - smoothstep(0.0, 0.3, vAltitude)) * 0.5;
     float twinkle = 0.76 + 0.24 * sin(uTime * (0.7 + fract(vPhase) * 1.6) * lowFlicker + vPhase * 19.17);
     gl_FragColor = vec4(vColor * (0.82 + twinkle * 0.3), core * uIntensity * twinkle * extinction);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
   }
 `;
 
@@ -121,6 +123,8 @@ const MOON_FRAGMENT = /* glsl */ `
 
     if (r > 1.0) {
       gl_FragColor = vec4(vec3(0.74, 0.82, 1.0), halo * uIntensity * 0.18);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
       return;
     }
 
@@ -159,6 +163,8 @@ const MOON_FRAGMENT = /* glsl */ `
     vec3 earthshine = albedo * vec3(0.36, 0.43, 0.58) * 0.09 * (1.0 - lit) * extinction;
     float alpha = (1.0 - smoothstep(0.965, 1.0, r)) * uIntensity * clamp(0.08 + lit * 0.92, 0.0, 1.0);
     gl_FragColor = vec4(sunlit + earthshine, alpha);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
   }
 `;
 
@@ -339,17 +345,12 @@ export function NightSky({ params }: { params: SceneParams }) {
     group.current?.position.copy(camera.position);
   });
 
+  // Moonlight itself is the scene's key light at night (SceneRig), so it
+  // casts real shadows and costs no extra light in every shader.
   return (
-    <>
-      <group ref={group} renderOrder={-10}>
-        <StarField params={params} />
-        <Moon params={params} />
-      </group>
-      <directionalLight
-        position={params.moon.pos}
-        intensity={params.moon.visible * 0.2 * (0.3 + params.moon.illumination * 0.7)}
-        color="#dbe7ff"
-      />
-    </>
+    <group ref={group} renderOrder={-10}>
+      <StarField params={params} />
+      <Moon params={params} />
+    </group>
   );
 }

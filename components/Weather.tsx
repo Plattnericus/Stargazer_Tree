@@ -1,10 +1,12 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import type { Precip } from "@/lib/weather";
 import { useQualityProfile } from "@/lib/quality";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import { fogAntiColor, fogSunColor, fogSunDir } from "@/lib/fog";
 
 const AREA = 34; // half-extent in X/Z
 const TOP = 46;
@@ -12,19 +14,38 @@ const TOP = 46;
 // Snow — soft drifting points. Fixed-size buffer + draw range so changing the
 // intensity never resizes a GPU attribute (three.js forbids that); the buffer
 // itself is sized by the quality tier and only re-allocates when that changes.
+// Precipitation is lit by the sky it falls through: bright streaks by day,
+// dim ones at night, and a white flicker when lightning strikes.
+function useLitColor(tint: string, flashRef: React.MutableRefObject<number>, gain: number, base: string) {
+  const target = useMemo(() => new THREE.Color(), []);
+  const baseColor = useMemo(() => new THREE.Color(base), [base]);
+  return (out: THREE.Color, dt: number) => {
+    target.set(tint).multiplyScalar(gain).multiply(baseColor);
+    out.lerp(target, Math.min(1, dt * 2));
+    const f = flashRef.current;
+    return f > 0.001 ? out.clone().addScalar(f * 0.9) : out;
+  };
+}
+
 function Snow({
   intensity,
   wind,
   gust,
   windVec,
   max,
+  tint,
+  flashRef,
 }: {
   intensity: number;
   wind: number;
   gust: number;
   windVec: [number, number];
   max: number;
+  tint: string;
+  flashRef: React.MutableRefObject<number>;
 }) {
+  const lit = useLitColor(tint, flashRef, 1.9, "#ffffff");
+  const snowColor = useMemo(() => new THREE.Color(tint), [tint]);
   const ref = useRef<THREE.Points>(null);
   const material = useRef<THREE.ShaderMaterial>(null);
   const count = Math.max(1, Math.floor(max * intensity));
@@ -41,11 +62,12 @@ function Snow({
     return { positions, speeds };
   }, [max]);
 
-  useFrame((state) => {
+  useFrame((state, dt) => {
     const pts = ref.current;
     const mat = material.current;
     if (!pts || !mat) return;
     pts.geometry.setDrawRange(0, count);
+    mat.uniforms.uColor.value.copy(lit(snowColor, dt));
     mat.uniforms.uTime.value = state.clock.elapsedTime;
     mat.uniforms.uFlow.value = wind + gust * 0.28;
     mat.uniforms.uWindDir.value.set(windVec[0], windVec[1]).normalize();
@@ -67,6 +89,7 @@ function Snow({
           uFlow: { value: 0 },
           uWindDir: { value: new THREE.Vector2(windVec[0], windVec[1]) },
           uOpacity: { value: 0.95 },
+          uColor: { value: new THREE.Color(1, 1, 1) },
         }}
         vertexShader={/* glsl */ `
           uniform float uTime;
@@ -92,13 +115,16 @@ function Snow({
         `}
         fragmentShader={/* glsl */ `
           uniform float uOpacity;
+          uniform vec3 uColor;
           varying float vAlpha;
           void main() {
             vec2 uv = gl_PointCoord - 0.5;
             float d = length(uv);
             if (d > 0.5) discard;
             float soft = smoothstep(0.5, 0.08, d);
-            gl_FragColor = vec4(vec3(1.0), soft * vAlpha * uOpacity);
+            gl_FragColor = vec4(uColor, soft * vAlpha * uOpacity);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
           }
         `}
       />
@@ -114,13 +140,19 @@ function Rain({
   gust,
   windVec,
   max,
+  tint,
+  flashRef,
 }: {
   intensity: number;
   wind: number;
   gust: number;
   windVec: [number, number];
   max: number;
+  tint: string;
+  flashRef: React.MutableRefObject<number>;
 }) {
+  const lit = useLitColor(tint, flashRef, 1.35, "#b4cdea");
+  const rainColor = useMemo(() => new THREE.Color(tint), [tint]);
   const ref = useRef<THREE.LineSegments>(null);
   const material = useRef<THREE.ShaderMaterial>(null);
   const count = Math.max(1, Math.floor(max * Math.max(0.35, intensity)));
@@ -150,11 +182,12 @@ function Rain({
     return { positions, speeds, tails };
   }, [max]);
 
-  useFrame((state) => {
+  useFrame((state, dt) => {
     const seg = ref.current;
     const mat = material.current;
     if (!seg || !mat) return;
     seg.geometry.setDrawRange(0, count * 2);
+    mat.uniforms.uColor.value.copy(lit(rainColor, dt));
     mat.uniforms.uTime.value = state.clock.elapsedTime;
     mat.uniforms.uFlow.value = wind + gust * 0.32;
     mat.uniforms.uWindDir.value.set(windVec[0], windVec[1]).normalize();
@@ -212,6 +245,8 @@ function Rain({
           varying float vAlpha;
           void main() {
             gl_FragColor = vec4(uColor, uOpacity * vAlpha);
+#include <tonemapping_fragment>
+#include <colorspace_fragment>
           }
         `}
       />
@@ -219,7 +254,25 @@ function Rain({
   );
 }
 
-// One puffy cartoon cloud cluster = a few overlapping flattened spheres.
+// Smooth value noise for the billow displacement below (CPU, build time only).
+function billowNoise(x: number, y: number, z: number, seed: number) {
+  const h = (i: number, j: number, k: number) => {
+    const v = Math.sin(i * 127.1 + j * 311.7 + k * 74.7 + seed * 19.3) * 43758.5453;
+    return v - Math.floor(v);
+  };
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const f = (t: number) => t * t * (3 - 2 * t);
+  const xf = f(x - xi), yf = f(y - yi), zf = f(z - zi);
+  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+  return lerp(
+    lerp(lerp(h(xi, yi, zi), h(xi + 1, yi, zi), xf), lerp(h(xi, yi + 1, zi), h(xi + 1, yi + 1, zi), xf), yf),
+    lerp(lerp(h(xi, yi, zi + 1), h(xi + 1, yi, zi + 1), xf), lerp(h(xi, yi + 1, zi + 1), h(xi + 1, yi + 1, zi + 1), xf), yf),
+    zf,
+  );
+}
+
+// One cumulus cluster: overlapping spheres with billowed surfaces (two noise
+// octaves pushed along the normal) and smooth normals, flattened at the base.
 function makePuffGeometry(seed: number) {
   const rng = (() => {
     let s = seed * 9973;
@@ -227,32 +280,77 @@ function makePuffGeometry(seed: number) {
   })();
   const geos: THREE.BufferGeometry[] = [];
   const puffs = 5 + Math.floor(rng() * 3);
+  const v = new THREE.Vector3();
   for (let i = 0; i < puffs; i++) {
     const r = 2.4 + rng() * 2.2;
-    const g = new THREE.IcosahedronGeometry(r, 1);
-    g.translate((rng() - 0.5) * 9, (rng() - 0.5) * 1.6, (rng() - 0.5) * 5);
-    g.scale(1, 0.7, 1);
+    const g = new THREE.IcosahedronGeometry(r, 3);
+    const pos = g.getAttribute("position") as THREE.BufferAttribute;
+    for (let k = 0; k < pos.count; k++) {
+      v.fromBufferAttribute(pos, k);
+      const n = v.clone().normalize();
+      const b =
+        billowNoise(v.x * 0.55, v.y * 0.55, v.z * 0.55, seed + i) * 0.7 +
+        billowNoise(v.x * 1.3, v.y * 1.3, v.z * 1.3, seed + i + 7) * 0.3;
+      v.addScaledVector(n, (b - 0.45) * r * 0.32);
+      // Flat-ish base: squash everything below the puff's equator.
+      if (v.y < 0) v.y *= 0.55;
+      pos.setXYZ(k, v.x, v.y, v.z);
+    }
+    g.translate((rng() - 0.5) * 9, (rng() - 0.5) * 1.6 + r * 0.25, (rng() - 0.5) * 5);
+    g.scale(1, 0.78, 1);
+    g.computeVertexNormals();
     geos.push(g);
   }
-  // simple concat merge (position only) then recompute normals for flat shading
-  let total = 0;
-  geos.forEach((g) => (total += (g.getAttribute("position").array as Float32Array).length));
-  const pos = new Float32Array(total);
-  let off = 0;
-  geos.forEach((g) => {
-    const ng = g.index ? g.toNonIndexed() : g;
-    const a = ng.getAttribute("position").array as Float32Array;
-    pos.set(a, off);
-    off += a.length;
-  });
-  const merged = new THREE.BufferGeometry();
-  merged.setAttribute("position", new THREE.BufferAttribute(pos.subarray(0, off), 3));
-  merged.computeVertexNormals();
-  return merged;
+  return mergeGeometries(geos, false)!;
 }
 
+// Cloud shading: sky light from above (dark, rain-heavy bases), wrapped
+// direct sun/moon light, a silver lining where the light sits behind the
+// cloud, and the lightning flash lighting it from inside. Scene fog applies.
+const PUFF_VERTEX = /* glsl */ `
+  varying vec3 vN;
+  varying vec3 vView;
+  #include <fog_pars_vertex>
+  void main() {
+    vec4 world = modelMatrix * vec4(position, 1.0);
+    vN = normalize(mat3(modelMatrix) * normal);
+    vView = normalize(cameraPosition - world.xyz);
+    vec4 mvPosition = viewMatrix * world;
+    gl_Position = projectionMatrix * mvPosition;
+    #include <fog_vertex>
+  }
+`;
+
+const PUFF_FRAGMENT = /* glsl */ `
+  uniform vec3 uLightDir;
+  uniform vec3 uLight; // direct light on the deck
+  uniform vec3 uSkyTop; // sky light from above
+  uniform vec3 uSkyBottom; // dim bounce from below
+  uniform float uFlash;
+  varying vec3 vN;
+  varying vec3 vView;
+  #include <fog_pars_fragment>
+  void main() {
+    vec3 n = normalize(vN);
+    vec3 v = normalize(vView);
+    vec3 l = normalize(uLightDir);
+    vec3 sky = mix(uSkyBottom, uSkyTop, n.y * 0.5 + 0.5);
+    float wrap = pow(max((dot(n, l) + 0.45) / 1.45, 0.0), 1.6);
+    float rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+    float behind = pow(max(dot(-v, l), 0.0), 4.0);
+    vec3 albedo = vec3(0.62, 0.64, 0.68); // rain clouds are dense and gray
+    vec3 col = albedo * (sky + uLight * wrap * 0.8) + uLight * rim * (0.15 + behind * 1.6);
+    col += vec3(0.85, 0.9, 1.0) * uFlash * (0.4 + rim);
+    gl_FragColor = vec4(col, 1.0);
+    #include <fog_fragment>
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }
+`;
+
 // Dark storm clouds that roll in (cartoon scale-pop + drift) whenever it rains,
-// and flash from within when lightning strikes (driven by `flashRef`).
+// and flash from within when lightning strikes (driven by `flashRef`). They
+// hover in a ring just above the crown, whatever its size.
 function StormClouds({
   active,
   flashRef,
@@ -260,6 +358,11 @@ function StormClouds({
   gust,
   windVec,
   moving = false,
+  top,
+  lightDir,
+  light,
+  skyTop,
+  skyBottom,
 }: {
   active: boolean;
   flashRef: React.MutableRefObject<number>;
@@ -267,36 +370,59 @@ function StormClouds({
   gust: number;
   windVec: [number, number];
   moving?: boolean;
+  top: number;
+  lightDir: [number, number, number];
+  light: string;
+  skyTop: string;
+  skyBottom: string;
 }) {
   const layout = useMemo(
     () =>
       Array.from({ length: 6 }, (_, i) => {
         const ang = (i / 6) * Math.PI * 2 + 0.4;
-        const rad = 16 + (i % 3) * 5;
+        const rad = 18 + (i % 3) * 6;
         return {
           geo: makePuffGeometry(i + 1),
-          pos: [Math.cos(ang) * rad, 26 + (i % 2) * 4, Math.sin(ang) * rad] as [number, number, number],
+          ang,
+          rad,
+          lift: (i % 2) * 4,
           phase: i * 1.3,
           drift: 0.5 + (i % 3) * 0.2,
         };
       }),
     [],
   );
+  useEffect(() => () => layout.forEach((l) => l.geo.dispose()), [layout]);
   const groups = useRef<(THREE.Group | null)[]>([]);
   const mat = useMemo(
     () =>
-      new THREE.MeshStandardMaterial({
-        color: "#5b636e",
-        roughness: 1,
-        metalness: 0,
-        flatShading: true,
-        emissive: new THREE.Color("#eaf2ff"),
-        emissiveIntensity: 0,
+      new THREE.ShaderMaterial({
+        uniforms: THREE.UniformsUtils.merge([
+          THREE.UniformsLib.fog,
+          {
+            uLightDir: { value: new THREE.Vector3(0, 1, 0) },
+            uLight: { value: new THREE.Color() },
+            uSkyTop: { value: new THREE.Color() },
+            uSkyBottom: { value: new THREE.Color() },
+            uFlash: { value: 0 },
+          },
+        ]),
+        vertexShader: PUFF_VERTEX,
+        fragmentShader: PUFF_FRAGMENT,
+        fog: true,
       }),
     [],
   );
+  useEffect(() => () => mat.dispose(), [mat]);
+  // Directional fog (lib/fog.ts): share the scene-wide arrays.
+  useMemo(() => {
+    mat.uniforms.fogSunDir = { value: fogSunDir };
+    mat.uniforms.fogSunColor = { value: fogSunColor };
+    mat.uniforms.fogAntiColor = { value: fogAntiColor };
+  }, [mat]);
   const frameSkip = useRef(0);
   const dtAcc = useRef(0);
+  const tmp = useMemo(() => new THREE.Color(), []);
 
   useFrame((state, dt) => {
     if (moving) {
@@ -310,7 +436,13 @@ function StormClouds({
       frameSkip.current = 0;
     }
     const t = state.clock.elapsedTime;
-    mat.emissiveIntensity = flashRef.current * 1.6;
+    const u = mat.uniforms;
+    u.uFlash.value = flashRef.current * 1.6;
+    const k = Math.min(1, dt * 1.5);
+    (u.uLightDir.value as THREE.Vector3).set(...lightDir).normalize();
+    (u.uLight.value as THREE.Color).lerp(tmp.set(light), k);
+    (u.uSkyTop.value as THREE.Color).lerp(tmp.set(skyTop), k);
+    (u.uSkyBottom.value as THREE.Color).lerp(tmp.set(skyBottom), k);
     for (let i = 0; i < layout.length; i++) {
       const g = groups.current[i];
       if (!g) continue;
@@ -324,9 +456,9 @@ function StormClouds({
       const cross = Math.cos(t * 0.052 * l.drift + l.phase) * 1.5;
       const sx = -windVec[1];
       const sz = windVec[0];
-      g.position.x = l.pos[0] + windVec[0] * drift + sx * cross;
-      g.position.y = l.pos[1] + Math.sin(t * 0.4 + l.phase) * 0.6;
-      g.position.z = l.pos[2] + windVec[1] * drift + sz * cross;
+      g.position.x = Math.cos(l.ang) * l.rad + windVec[0] * drift + sx * cross;
+      g.position.y = top + l.lift + Math.sin(t * 0.4 + l.phase) * 0.6;
+      g.position.z = Math.sin(l.ang) * l.rad + windVec[1] * drift + sz * cross;
     }
   });
 
@@ -338,7 +470,6 @@ function StormClouds({
           ref={(g) => {
             groups.current[i] = g;
           }}
-          position={l.pos}
           scale={0.001}
           visible={false}
         >
@@ -470,6 +601,11 @@ export function Weather({
   storm = false,
   budget = 1,
   moving = false,
+  treeTop = TOP,
+  lightDir = [0, 1, 0],
+  cloudLight = "#ffffff",
+  skyTop = "#8899aa",
+  skyBottom = "#334455",
 }: {
   precip: Precip;
   intensity: number;
@@ -480,6 +616,12 @@ export function Weather({
   /** 0..1 PerformanceMonitor budget — scales particle counts under load. */
   budget?: number;
   moving?: boolean;
+  /** World height of the crown top: storm clouds and precipitation follow it. */
+  treeTop?: number;
+  lightDir?: [number, number, number];
+  cloudLight?: string;
+  skyTop?: string;
+  skyBottom?: string;
 }) {
   const flashRef = useRef(0);
   const profile = useQualityProfile();
@@ -487,11 +629,33 @@ export function Weather({
   const rainMax = Math.max(80, Math.round(profile.rainMax * budget));
   const snowMax = Math.max(60, Math.round(profile.snowMax * budget));
 
+  // The precipitation volume is built for a TOP-high column; stretch it to
+  // reach a taller crown (a slight streak stretch reads fine).
+  const columnScale = Math.max(1, (treeTop + 6) / TOP);
+
   return (
     <>
-      {precip === "snow" && <Snow intensity={intensity} wind={wind} gust={gust} windVec={windVec} max={snowMax} />}
-      {isRain && <Rain intensity={intensity} wind={wind} gust={gust} windVec={windVec} max={rainMax} />}
-      <StormClouds active={isRain} flashRef={flashRef} wind={wind} gust={gust} windVec={windVec} moving={moving} />
+      <group scale={[1, columnScale, 1]}>
+        {precip === "snow" && (
+          <Snow intensity={intensity} wind={wind} gust={gust} windVec={windVec} max={snowMax} tint={skyBottom} flashRef={flashRef} />
+        )}
+        {isRain && (
+          <Rain intensity={intensity} wind={wind} gust={gust} windVec={windVec} max={rainMax} tint={skyBottom} flashRef={flashRef} />
+        )}
+      </group>
+      <StormClouds
+        active={isRain}
+        flashRef={flashRef}
+        wind={wind}
+        gust={gust}
+        windVec={windVec}
+        moving={moving}
+        top={treeTop + 2}
+        lightDir={lightDir}
+        light={cloudLight}
+        skyTop={skyTop}
+        skyBottom={skyBottom}
+      />
       <Lightning flashRef={flashRef} active={storm} moving={moving} />
     </>
   );

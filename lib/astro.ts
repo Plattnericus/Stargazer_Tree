@@ -146,6 +146,26 @@ export function moonIllumination(date: Date): MoonIllumination {
   };
 }
 
+/**
+ * Az/alt of a fixed celestial position (right ascension/declination, radians)
+ * as seen from lat/lon at `date` — e.g. to orient the Milky Way.
+ */
+export function celestialPosition(
+  date: Date,
+  lat: number,
+  lon: number,
+  ra: number,
+  dec: number,
+): SkyPosition {
+  const lw = RAD * -lon;
+  const phi = RAD * lat;
+  const H = siderealTime(toDays(date), lw) - ra;
+  return {
+    azimuth: azimuthFromSouth(H, phi, dec),
+    altitude: altitudeAbove(H, phi, dec),
+  };
+}
+
 // Map an az/alt sky position to the scene's world frame.
 // Scene convention (see windVectorFromDirection): +X east, +Z north, +Y up.
 export function sceneDirection(azimuth: number, altitude: number): [number, number, number] {

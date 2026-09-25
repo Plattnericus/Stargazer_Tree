@@ -55,8 +55,11 @@ export default function Clock({
   }, [mode]);
 
   const ready = mode === "manual" || now !== null;
-  const hour = mode === "live" ? (now?.hour ?? 12) : Math.max(0, Math.min(23, manualHour));
-  const minute = mode === "live" ? (now?.minute ?? 0) : 0;
+  // Manual time may be fractional (e.g. ?hour=6.5 from the QA override):
+  // show it as real minutes instead of "6.5:00".
+  const manual = Math.max(0, Math.min(23 + 59 / 60, manualHour));
+  const hour = mode === "live" ? (now?.hour ?? 12) : Math.floor(manual);
+  const minute = mode === "live" ? (now?.minute ?? 0) : Math.round((manual - Math.floor(manual)) * 60) % 60;
   const label = ready
     ? `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
     : "--:--";

@@ -34,6 +34,12 @@ export type QualityProfile = {
   movingDpr: number;
   /** Render at least at the screen's own pixel ratio (capped at 2), e.g. true 4K on a 4K Retina screen. */
   nativeDpr: boolean;
+  /**
+   * Drawing-buffer pixels the tier starts at, at most. Past this a bigger
+   * window only adds fill cost (post, canopy overdraw, sky), so the start DPR
+   * shrinks to fit; adaptive quality may still raise it where there's headroom.
+   */
+  idlePixels: number;
   antialias: boolean;
   // Volumetric clouds
   idleCloudQuality: number;
@@ -56,6 +62,7 @@ export type QualityProfile = {
   flowers: number;
   // Sky
   stars: number;
+  skyLutSize: [number, number]; // sky-view LUT resolution (azimuth x elevation)
   // Particles
   rainMax: number;
   snowMax: number;
@@ -65,6 +72,7 @@ export type QualityProfile = {
   antsPerHouse: number;
   antsTrunk: number;
   antMixerStride: number; // update skinned animations every Nth frame
+  antShadows: boolean; // villagers cast shadows (tiny; a skinned draw each per shadow pass)
   // Post
   bloom: boolean; // subtle filmic bloom (lanterns, sun, fireflies)
   postprocessingSamples: 0 | 2 | 4; // MSAA samples for postprocessing render targets
@@ -85,6 +93,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     maxDpr: 1.05,
     movingDpr: 0.88,
     nativeDpr: false,
+    idlePixels: 1.0e6,
     antialias: false,
     idleCloudQuality: 0.26,
     movingCloudQuality: 0.05,
@@ -103,6 +112,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bushes: 55,
     flowers: 130,
     stars: 160,
+    skyLutSize: [128, 64],
     rainMax: 500,
     snowMax: 280,
     fireflies: 16,
@@ -110,6 +120,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     antsPerHouse: 2,
     antsTrunk: 10,
     antMixerStride: 2,
+    antShadows: false,
     bloom: false,
     postprocessingSamples: 0,
     vignette: false,
@@ -127,6 +138,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     maxDpr: 1.15,
     movingDpr: 1.0,
     nativeDpr: false,
+    idlePixels: 1.5e6,
     antialias: false,
     idleCloudQuality: 0.42,
     movingCloudQuality: 0.08,
@@ -145,6 +157,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bushes: 95,
     flowers: 260,
     stars: 320,
+    skyLutSize: [160, 80],
     rainMax: 800,
     snowMax: 450,
     fireflies: 24,
@@ -152,6 +165,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     antsPerHouse: 2,
     antsTrunk: 12,
     antMixerStride: 2,
+    antShadows: false,
     bloom: false,
     postprocessingSamples: 0,
     vignette: false,
@@ -170,6 +184,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     maxDpr: 1.35,
     movingDpr: 1.15,
     nativeDpr: false,
+    idlePixels: 2.1e6,
     antialias: false,
     idleCloudQuality: 0.54,
     movingCloudQuality: 0.1,
@@ -188,6 +203,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bushes: 130,
     flowers: 420,
     stars: 560,
+    skyLutSize: [192, 96],
     rainMax: 1200,
     snowMax: 700,
     fireflies: 36,
@@ -195,6 +211,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     antsPerHouse: 3,
     antsTrunk: 18,
     antMixerStride: 2,
+    antShadows: false,
     bloom: true,
     postprocessingSamples: 0,
     vignette: false,
@@ -210,6 +227,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     maxDpr: 1.4,
     movingDpr: 1.25,
     nativeDpr: true,
+    idlePixels: 2.8e6,
     antialias: false,
     idleCloudQuality: 0.58,
     movingCloudQuality: 0.1,
@@ -228,6 +246,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bushes: 160,
     flowers: 560,
     stars: 620,
+    skyLutSize: [192, 96],
     rainMax: 1300,
     snowMax: 760,
     fireflies: 40,
@@ -235,6 +254,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     antsPerHouse: 3,
     antsTrunk: 20,
     antMixerStride: 2,
+    antShadows: true,
     bloom: true,
     postprocessingSamples: 0,
     vignette: true,
@@ -250,6 +270,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     maxDpr: 1.65,
     movingDpr: 1.45,
     nativeDpr: true,
+    idlePixels: 4.0e6,
     antialias: false,
     idleCloudQuality: 0.62,
     movingCloudQuality: 0.12,
@@ -268,6 +289,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     bushes: 190,
     flowers: 640,
     stars: 700,
+    skyLutSize: [256, 128],
     rainMax: 1500,
     snowMax: 850,
     fireflies: 46,
@@ -275,6 +297,7 @@ export const QUALITY_PROFILES: Record<ResolvedGraphicsQuality, QualityProfile> =
     antsPerHouse: 3,
     antsTrunk: 22,
     antMixerStride: 1,
+    antShadows: true,
     bloom: true,
     postprocessingSamples: 0,
     vignette: true,
