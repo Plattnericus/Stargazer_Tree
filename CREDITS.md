@@ -36,3 +36,4 @@
 | Grass             | MauroGonzalezA| https://sketchfab.com/3d-models/grass-4b800e07ea3543e3870ad5e53b39d825                          | CC-BY-4.0        |
 | Moon Albedo Map   | NASA CGI Moon Kit | https://svs.gsfc.nasa.gov/4720                                                              | Public Domain    |
 | Moral Support     | Ryhox         |                                                                                                 |                  |
+| Inside the church of Boden - Austria (optimized scan) | Jan | https://sketchfab.com/3d-models/inside-the-church-of-boden-austria-106c72c2a6474850b06132ab868969ae | CC-BY-4.0 |

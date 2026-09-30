@@ -47,6 +47,14 @@ Weather affects lighting, fog, volumetric clouds, grass, leaves, branch sway, pr
 
 ### Performance-Focused 3D
 
+The small ivory dove is a hidden memorial, tucked into the rear of the village.
+Finding and clicking it opens the church of Boden as a full-screen scroll walk.
+GSAP ScrollTrigger drives a camera path along the central aisle, with
+quiet typography and a link to the memorial page. Reduced-motion mode
+keeps the camera still. The scan, Draco decoder, and fonts are served locally;
+the island pauses while the church is open and the church renders on demand.
+Asset and font licenses are included with the project.
+
 - React Three Fiber and Drei scene composition.
 - Adaptive DPR and cloud quality based on frame budget.
 - Shader-driven volumetric clouds.

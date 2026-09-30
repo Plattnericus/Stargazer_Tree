@@ -787,6 +787,7 @@ export default function Experience({
   stargazers = null,
   graphicsQuality = "medium",
   uiOverlayOpen = false,
+  suspended = false,
   showStats = false,
   onSelectHouse,
   onFindDove,
@@ -801,6 +802,8 @@ export default function Experience({
   stargazers?: Stargazer[] | null;
   graphicsQuality?: Quality;
   uiOverlayOpen?: boolean;
+  /** Stop the island's GPU work while the church fills the screen. */
+  suspended?: boolean;
   /** Collect the numbers for the FPS overlay. */
   showStats?: boolean;
   onSelectHouse?: (i: number) => void;
@@ -1062,7 +1065,6 @@ export default function Experience({
           moving={performanceMoving}
           treeTop={TREE_Y + worldH}
         />
-        <Dove interactive={!flying} onFind={onFindDove} moving={performanceMoving} />
 
         <Float
           speed={performanceMoving ? 0 : 1.1}
@@ -1093,6 +1095,7 @@ export default function Experience({
             hazeColor={params.fogColor}
           />
           <group position={[0, TREE_Y, 0]} scale={TREE_BOOST}>
+            <Dove stars={stars} stargazers={stargazers} interactive={!flying && !uiOverlayOpen} onFind={onFindDove} moving={performanceMoving} />
             <Tree
               stars={stars}
               wind={params.wind}
@@ -1205,7 +1208,7 @@ export default function Experience({
   return (
     <Canvas
       key={graphicsQuality}
-      frameloop="always"
+      frameloop={suspended ? "never" : "always"}
       shadows
       dpr={effectiveDpr}
       // Measure the layout size, not the transformed box: the page scales the

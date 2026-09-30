@@ -5,170 +5,205 @@ import { useFrame, type ThreeEvent } from "@react-three/fiber";
 import { useGLTF } from "@react-three/drei";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 import * as THREE from "three";
-import { makeWing, flapAngle } from "@/lib/wing";
+import { bonsaiNodes, spineAt } from "@/lib/bonsai";
+import { MAX_HOUSES } from "@/lib/layout";
+import { trunkBaseRadius, trunkHeight } from "@/lib/growth";
+import { deckRadius, type Tier } from "@/lib/rarity";
 
 const BIRD = "/models/bird_orange.glb";
+const DOVE_SCALE = 0.42;
 
-// The realistic rigged bird recoloured to ivory + broad procedural wings that
-// actually flap → a detailed peace dove. It glides a calm, findable solo orbit
-// over the island. Clicking it is a quiet secret (opens the in-memoriam panel).
-const DOVE_SCALE = 1.0;
-const MODEL_YAW = 0;
-const WING_COLOR = "#f4f3ec";
-
+// A small, folded-wing dove rests on an existing rear platform railing. There is
+// no marker or flying orbit: exploring the back of the tree reveals it.
 export function Dove({
+  stars = 0,
   interactive = true,
   onFind,
   moving = false,
+  stargazers = null,
 }: {
+  stars?: number;
   interactive?: boolean;
   onFind?: () => void;
   moving?: boolean;
+  stargazers?: { tier?: Tier }[] | null;
 }) {
   const { scene, animations } = useGLTF(BIRD);
   const wrapper = useRef<THREE.Group>(null);
   const inner = useRef<THREE.Group>(null);
+  const discoverable = useRef(false);
+  const hoveredRef = useRef(false);
   const [hovered, setHovered] = useState(false);
+  const reducedMotion = useRef(false);
+  const cameraPosition = useMemo(() => new THREE.Vector3(), []);
 
-  const { obj, mixer, wingL, wingR } = useMemo(() => {
-    const obj = cloneSkeleton(scene);
-    // Recolour to ivory: drop the plumage colour map, tint white, faint glow.
-    obj.traverse((o) => {
-      if (o instanceof THREE.Mesh && o.material) {
-        const src = Array.isArray(o.material) ? o.material : [o.material];
-        o.material = src.map((m) => {
-          const c = (m as THREE.MeshStandardMaterial).clone();
-          c.map = null;
-          c.color = new THREE.Color("#f3f2ec");
-          if ("emissive" in c) {
-            c.emissive = new THREE.Color("#fffaf0");
-            c.emissiveIntensity = 0.2;
-          }
-          if ("roughness" in c) c.roughness = Math.min(1, (c.roughness ?? 0.7) + 0.1);
-          if ("metalness" in c) c.metalness = 0;
-          return c;
-        });
-        o.castShadow = true;
-      }
+  const perch = useMemo(() => {
+    const active = Math.min(MAX_HOUSES, Math.max(0, Math.floor(stars)));
+    if (active >= 2) {
+      const nodes = bonsaiNodes(active);
+      const middle = trunkHeight(active) * 0.52;
+      const preferred = new THREE.Vector3(-Math.SQRT1_2, 0, -Math.SQRT1_2);
+      const score = (node: (typeof nodes)[number]) => {
+        const alignment =
+          Math.cos(node.angle) * preferred.x +
+          Math.sin(node.angle) * preferred.z;
+        return (
+          (1 - alignment) * 3 +
+          Math.abs(node.base.y - middle) / Math.max(1, middle)
+        );
+      };
+      const branch = nodes.reduce((best, node) =>
+        score(node) < score(best) ? node : best,
+      );
+      const radial = new THREE.Vector3(
+        Math.cos(branch.angle),
+        0,
+        Math.sin(branch.angle),
+      );
+      // The outer rear railing is outside the foliage exclusion volume.
+      // A bird buried in the crown would be clickable but impossible to see.
+      const tip = branch.tip
+        .clone()
+        .addScaledVector(radial, deckRadius(branch.index, stargazers) * 0.97);
+      tip.y += 0.55;
+      return { center: branch.base, radial, tip, angle: branch.angle };
+    }
+    // Matches the y=2.4, angle=3.7 stub in Tree's merged wood geometry.
+    const y = 2.4;
+    const angle = 3.7;
+    const center = spineAt(y);
+    const radial = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle));
+    const direction = radial
+      .clone()
+      .add(new THREE.Vector3(0, 0.36, 0))
+      .normalize();
+    const radius = Math.max(
+      0.12,
+      trunkBaseRadius(stars) * Math.pow(1 - y / trunkHeight(stars), 0.72),
+    );
+    const tip = center.clone().addScaledVector(direction, radius * 0.85 + 0.42);
+    tip.y += 0.13;
+    return { center, radial, tip, angle };
+  }, [stars, stargazers]);
+
+  const { object, mixer, materials } = useMemo(() => {
+    const object = cloneSkeleton(scene);
+    const materials: THREE.MeshStandardMaterial[] = [];
+    object.traverse((node) => {
+      if (!(node instanceof THREE.Mesh) || !node.material) return;
+      const source = Array.isArray(node.material)
+        ? node.material
+        : [node.material];
+      const ivory = source.map((material) => {
+        const copy = (material as THREE.MeshStandardMaterial).clone();
+        copy.map = null;
+        copy.color.set("#dedcd1");
+        copy.emissive?.set("#000000");
+        copy.emissiveIntensity = 0;
+        copy.roughness = 0.9;
+        copy.metalness = 0;
+        materials.push(copy);
+        return copy;
+      });
+      node.material = Array.isArray(node.material) ? ivory : ivory[0];
+      node.castShadow = true;
     });
-    const mixer = new THREE.AnimationMixer(obj);
+    const mixer = new THREE.AnimationMixer(object);
     if (animations[0]) {
       const action = mixer.clipAction(animations[0]);
+      action.timeScale = 0.35;
       action.play();
-      action.timeScale = 0.6; // graceful head/tail motion
     }
-    const wingR = makeWing(1, WING_COLOR, "#d2d2c8", 0.9);
-    const wingL = makeWing(-1, WING_COLOR, "#d2d2c8", 0.9);
-    wingR.position.set(0.14, 0.72, 0.08);
-    wingL.position.set(-0.14, 0.72, 0.08);
-    return { obj, mixer, wingL, wingR };
+    return { object, mixer, materials };
   }, [scene, animations]);
 
   useEffect(() => {
-    return () => {
-      mixer.stopAllAction();
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => {
+      reducedMotion.current = media.matches;
     };
-  }, [mixer]);
+    update();
+    media.addEventListener("change", update);
+    return () => {
+      media.removeEventListener("change", update);
+      mixer.stopAllAction();
+      materials.forEach((material) => material.dispose());
+      if (hoveredRef.current) document.body.style.cursor = "auto";
+    };
+  }, [mixer, materials]);
 
+  const leave = () => {
+    hoveredRef.current = false;
+    setHovered(false);
+    document.body.style.cursor = "auto";
+  };
   useEffect(() => {
-    if (!interactive) {
-      setHovered(false);
-      document.body.style.cursor = "auto";
-    }
+    if (!interactive) leave();
   }, [interactive]);
-
-  // calm, findable orbit over the island
-  const path = useMemo(
-    () => ({ radius: 14, height: 12.5, speed: 0.11, phase: 1.2, bob: 0.7 }),
-    [],
-  );
-  const rot = useRef(new THREE.Euler(0, 0, 0, "YXZ"));
-  const prev = useRef(new THREE.Vector3());
-  const pos = useRef(new THREE.Vector3());
-  const vel = useRef(new THREE.Vector3());
   const mixerFrame = useRef(0);
   const mixerAccum = useRef(0);
-
-  useFrame((state, dt) => {
-    const t = state.clock.elapsedTime;
-    const g = wrapper.current;
-    if (!g) return;
-    const a = t * path.speed + path.phase;
-    const p = pos.current.set(
-      Math.cos(a) * path.radius,
-      path.height + Math.sin(t * 0.45 + path.bob) * 1.6,
-      Math.sin(a) * path.radius,
-    );
-
-    const v = vel.current.copy(p).sub(prev.current);
-    prev.current.copy(p);
-    const sp = v.length();
-    if (sp > 1e-4) {
-      const yaw = Math.atan2(v.x, v.z) + MODEL_YAW;
-      const pitch = -Math.asin(THREE.MathUtils.clamp(v.y / sp, -1, 1)) * 0.6;
-      let dyaw = yaw - rot.current.y;
-      while (dyaw > Math.PI) dyaw -= Math.PI * 2;
-      while (dyaw < -Math.PI) dyaw += Math.PI * 2;
-      rot.current.y += dyaw * Math.min(1, dt * 6);
-      rot.current.x += (pitch - rot.current.x) * Math.min(1, dt * 4);
-      rot.current.z += (-dyaw * 6 - rot.current.z) * Math.min(1, dt * 4);
-    }
-
-    // graceful flapping wings + a body bob synced to the beat
-    const hz = 6;
-    const flap = flapAngle(t, path.phase, true, hz);
-    wingR.rotation.z = flap;
-    wingL.rotation.z = -flap;
-    g.position.set(p.x, p.y + Math.sin(t * hz + path.phase) * 0.05, p.z);
-    g.rotation.copy(rot.current);
-
-    const target = hovered ? DOVE_SCALE * 1.16 : DOVE_SCALE;
+  useFrame(({ camera }, dt) => {
+    const group = wrapper.current;
+    if (!group?.parent) return;
+    camera.getWorldPosition(cameraPosition);
+    group.parent.worldToLocal(cameraPosition);
+    const dx = cameraPosition.x - perch.center.x;
+    const dz = cameraPosition.z - perch.center.z;
+    const facing =
+      (dx * perch.radial.x + dz * perch.radial.z) /
+      Math.max(0.001, Math.hypot(dx, dz));
+    // Also gate the hit target: Three's event raycast can otherwise hit an
+    // invisible sphere through the trunk and give away the secret on hover.
+    discoverable.current = facing > 0.05;
+    group.visible = facing > -0.1;
+    if (!discoverable.current && hoveredRef.current) leave();
     if (inner.current) {
-      const s = inner.current.scale.x + (target - inner.current.scale.x) * 0.12;
-      inner.current.scale.setScalar(s);
+      const target = hovered ? DOVE_SCALE * 1.09 : DOVE_SCALE;
+      const scale = THREE.MathUtils.damp(inner.current.scale.x, target, 9, dt);
+      inner.current.scale.setScalar(scale);
     }
+    if (!group.visible || reducedMotion.current) return;
     mixerFrame.current += 1;
     mixerAccum.current += dt;
-    const mixerStride = moving ? 2 : 1;
-    if (mixerFrame.current % mixerStride === 0) {
+    if (mixerFrame.current % (moving ? 3 : 2) === 0) {
       mixer.update(mixerAccum.current);
       mixerAccum.current = 0;
     }
   });
 
-  const enter = (e: ThreeEvent<PointerEvent>) => {
-    e.stopPropagation();
+  const enter = (event: ThreeEvent<PointerEvent>) => {
+    if (!discoverable.current) return;
+    event.stopPropagation();
+    hoveredRef.current = true;
     setHovered(true);
     document.body.style.cursor = "pointer";
   };
-  const leave = () => {
-    setHovered(false);
-    document.body.style.cursor = "auto";
-  };
-  const click = (e: ThreeEvent<MouseEvent>) => {
-    e.stopPropagation();
+  const click = (event: ThreeEvent<MouseEvent>) => {
+    if (!discoverable.current) return;
+    event.stopPropagation();
+    leave();
     onFind?.();
   };
-  const hitHandlers =
-    interactive && onFind
-      ? {
-          onPointerOver: enter,
-          onPointerOut: leave,
-          onClick: click,
-        }
-      : {};
 
   return (
-    <group ref={wrapper}>
+    <group
+      ref={wrapper}
+      name="memorial-dove"
+      position={perch.tip}
+      rotation={[0, perch.angle, 0]}
+      visible={false}
+    >
       <group ref={inner} scale={DOVE_SCALE}>
-        {/* generous invisible hit target — the dove is small and moving */}
-        <mesh position={[0, 0.7, 0]} {...hitHandlers}>
-          <sphereGeometry args={[1.5, 8, 8]} />
+        <mesh
+          position={[0, 0.65, 0]}
+          {...(interactive && onFind
+            ? { onPointerOver: enter, onPointerOut: leave, onClick: click }
+            : {})}
+        >
+          <sphereGeometry args={[0.9, 8, 8]} />
           <meshBasicMaterial transparent opacity={0} depthWrite={false} />
         </mesh>
-        <primitive object={obj} />
-        <primitive object={wingL} />
-        <primitive object={wingR} />
+        <primitive object={object} />
       </group>
     </group>
   );

@@ -1,13 +1,20 @@
 import type { Metadata, Viewport } from "next";
-import { Nunito } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import { fetchOwner, ownerLogin } from "@/lib/owner";
 import { siteUrl } from "@/lib/site";
 
 // One cozy, highly readable rounded face for the WHOLE site (self-hosted via
-// next/font — no external requests, no layout shift).
-const nunito = Nunito({
-  subsets: ["latin"],
+// next/font/local — builds and rendering work without a Google Fonts request).
+const nunito = localFont({
+  src: [
+    { path: "../public/fonts/nunito-cyrillic-ext.woff2", weight: "200 1000", style: "normal" },
+    { path: "../public/fonts/nunito-cyrillic.woff2", weight: "200 1000", style: "normal" },
+    { path: "../public/fonts/nunito-vietnamese.woff2", weight: "200 1000", style: "normal" },
+    { path: "../public/fonts/nunito-latin-ext.woff2", weight: "200 1000", style: "normal" },
+    { path: "../public/fonts/nunito-latin.woff2", weight: "200 1000", style: "normal" },
+  ],
+  preload: false,
   variable: "--font-nunito",
   display: "swap",
 });

@@ -21,7 +21,6 @@ import GameHUD from "@/components/GameHUD";
 import FpsCounter from "@/components/FpsCounter";
 import RateLimitNotice from "@/components/RateLimitNotice";
 import SoftwareRenderingNotice from "@/components/SoftwareRenderingNotice";
-import MemorialSecret from "@/components/MemorialSecret";
 import LoadingOverlay from "@/components/LoadingOverlay";
 import { FlyIcon } from "@/components/Icons";
 import { cameraBus, DEFAULT_FOV, MAX_FOV, MIN_FOV, type CamMode } from "@/lib/cameraBus";
@@ -46,6 +45,7 @@ const Experience = dynamic(() => import("@/components/Experience"), {
   ssr: false,
   loading: () => <div className="absolute inset-0 bg-[#0b1320]" />,
 });
+const MemorialSecret = dynamic(() => import("@/components/MemorialSecret"), { ssr: false });
 
 const STARGAZER_REFRESH_MS = 5 * 60 * 1000;
 const WEATHER_REFRESH_MS = 10 * 60 * 1000;
@@ -599,6 +599,7 @@ function Home() {
             stargazers={stargazers}
             graphicsQuality={resolvedGraphicsQuality}
             uiOverlayOpen={overlayOpen}
+            suspended={secretOpen}
             showStats={showFps}
             onSelectHouse={handleHouseClick}
             onFindDove={() => setSecretOpen(true)}
